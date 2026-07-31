@@ -73,7 +73,7 @@ hash_k = sha256(model_id || kv_params || hash_{k-1} || tokens_k)
 - `kv_params`: serialized string of KV-affecting parameters: `type_k`, `type_v`,
   `n_pos_per_embd` (values joined, e.g. "f16|f16|1").
 - `tokens_k`: the 1024 token ids of segment k (raw bytes).
-- The hash is truncated to a fixed length for the file name (e.g. 16 hex bytes).
+- The hash is truncated to 16 bytes (32 hex chars) for the file name.
 - Chain head uses an empty string for the previous hash.
 
 Content layout (little-endian):
