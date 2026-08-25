@@ -2567,6 +2567,89 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_SAVE_INCR:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    std::string filename = task.slot_action.filename;
+                    std::string filepath = task.slot_action.filepath;
+
+                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+                    const int32_t n_segments = llama_state_seq_save_incr(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size());
+
+                    const int64_t t_end = ggml_time_us();
+                    const double t_save_ms = (t_end - t_start) / 1000.0;
+
+                    if (n_segments < 0) {
+                        send_error(task, "Failed to save slot state (GGSD): KV cache is missing the head of the sequence", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_incr>();
+                    res->id         = task.id;
+                    res->id_slot    = id_slot;
+                    res->filename   = filename;
+                    res->is_save    = true;
+                    res->n_segments = n_segments;
+                    res->n_tokens   = (size_t) n_segments * 1024;
+                    res->t_ms       = t_save_ms;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_RESTORE_INCR:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    std::string filename = task.slot_action.filename;
+                    std::string filepath = task.slot_action.filepath;
+
+                    const llama_tokens & tokens = task.slot_action.prompt_tokens;
+                    const size_t n_restored = llama_state_seq_load_incr(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), task.slot_action.min_prefix);
+
+                    const int64_t t_end = ggml_time_us();
+                    const double t_restore_ms = (t_end - t_start) / 1000.0;
+
+                    // keep only the restored prefix in the prompt cache;
+                    // the remainder is re-processed by the next completion
+                    slot->prompt.tokens.clear();
+                    if (n_restored > 0) {
+                        slot->prompt.tokens.insert(llama_tokens(tokens.begin(), tokens.begin() + n_restored));
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_incr>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->filename = filename;
+                    res->is_save  = false;
+                    res->n_tokens = n_restored;
+                    res->t_ms     = t_restore_ms;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -4665,8 +4748,11 @@ void server_routes::init_routes() {
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
         }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
+        if (action == "save_incr") {
+            return handle_slots_save_incr(req, id_slot);
+        }
+        if (action == "restore_incr") {
+            return handle_slots_restore_incr(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
@@ -5228,6 +5314,83 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_save_incr(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    std::string filename = request_data.at("filename");
+    if (!fs_validate_filename(filename)) {
+        res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    std::string filepath = params.slot_save_path + "session_" + filename + ".bin";
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_SAVE_INCR);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot  = id_slot;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = filepath;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_restore_incr(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    std::string filename = request_data.at("filename");
+    if (!fs_validate_filename(filename)) {
+        res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const std::string prompt = request_data.at("prompt").get<std::string>();
+    const size_t min_prefix = json_value(request_data, "min_prefix", 64);
+    std::string filepath = params.slot_save_path + "session_" + filename + ".bin";
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_RESTORE_INCR);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot  = id_slot;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = filepath;
+        task.slot_action.prompt_tokens = common_tokenize(ctx_server.vocab, prompt, true, true);
+        task.slot_action.min_prefix = min_prefix;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_incr*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }
