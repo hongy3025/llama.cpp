@@ -25,6 +25,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_SAVE_INCR,
+    SERVER_TASK_TYPE_SLOT_RESTORE_INCR,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -166,6 +168,10 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+
+        // used by SERVER_TASK_TYPE_SLOT_RESTORE_INCR
+        llama_tokens prompt_tokens;
+        size_t min_prefix = 64;
     };
     slot_action slot_action;
 
@@ -524,6 +530,17 @@ struct server_task_result_slot_save_load : server_task_result {
 
     size_t n_tokens;
     size_t n_bytes;
+    double t_ms;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_incr : server_task_result {
+    std::string filename;
+    bool is_save; // true = save, false = load
+
+    size_t n_segments; // save: number of segments in the session chain
+    size_t n_tokens;   // save: tokens covered by the chain; load: tokens restored
     double t_ms;
 
     virtual json to_json() override;

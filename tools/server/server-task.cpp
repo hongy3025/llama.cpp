@@ -1616,7 +1616,6 @@ std::string server_task_result_metrics::to_metrics() {
     return prometheus.str();
 }
 
-//
 // server_task_result_slot_save_load
 //
 json server_task_result_slot_save_load::to_json() {
@@ -1640,6 +1639,28 @@ json server_task_result_slot_save_load::to_json() {
         { "timings", {
             { "restore_ms", t_ms }
         }},
+    };
+}
+
+//
+// server_task_result_slot_incr
+//
+json server_task_result_slot_incr::to_json() {
+    if (is_save) {
+        return json {
+            { "id_slot",    id_slot },
+            { "filename",   filename },
+            { "n_segments", n_segments },
+            { "n_tokens",   n_tokens },
+            { "t_ms",       t_ms },
+        };
+    }
+
+    return json {
+        { "id_slot",           id_slot },
+        { "filename",          filename },
+        { "n_tokens_restored", n_tokens },
+        { "t_ms",              t_ms },
     };
 }
 

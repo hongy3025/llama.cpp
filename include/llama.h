@@ -885,6 +885,14 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
+    LLAMA_API size_t llama_state_seq_load_file(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+                   llama_token * tokens_out,
+                          size_t   n_token_capacity,
+                          size_t * n_token_count_out);
+
     // GGSD - incremental sequence state save/load
     //
     // Save the KV state of a sequence as a chain of 1024-token segments,
