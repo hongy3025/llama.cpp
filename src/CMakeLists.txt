@@ -39,6 +39,7 @@ add_library(llama
             llama-quant.cpp
             llama-sampler.cpp
             llama-sha256.c
+            llama-state-incr.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp

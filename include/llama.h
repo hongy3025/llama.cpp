@@ -885,14 +885,29 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
-    // If tokens_out is NULL, only the token count is reported through n_token_count_out and no state is loaded
-    LLAMA_API size_t llama_state_seq_load_file(
+    // GGSD - incremental sequence state save/load
+    //
+    // Save the KV state of a sequence as a chain of 1024-token segments,
+    // content-addressed by a hash of (model, kv params, previous hash, tokens).
+    // Segments shared with previous saves are reused (append / fork semantics).
+    // Returns the number of segments in the session chain after the save,
+    // 0 if nothing changed, or -1 on error.
+    LLAMA_API int32_t llama_state_seq_save_incr(
             struct llama_context * ctx,
-                      const char * filepath,
-                    llama_seq_id   dest_seq_id,
-                     llama_token * tokens_out,
-                          size_t   n_token_capacity,
-                          size_t * n_token_count_out);
+                      const char * session_path,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count);
+
+    // Restore the aligned prefix of the session chain matching the prompt.
+    // Returns the number of tokens restored, or 0 if no match / error.
+    LLAMA_API size_t llama_state_seq_load_incr(
+            struct llama_context * ctx,
+                      const char * session_path,
+                    llama_seq_id   seq_id,
+               const llama_token * prompt_tokens,
+                          size_t   n_prompt_tokens,
+                          size_t   min_prefix_tokens);
 
 #define LLAMA_STATE_SEQ_FLAGS_NONE 0
 

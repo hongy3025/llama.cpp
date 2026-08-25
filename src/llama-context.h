@@ -180,6 +180,9 @@ struct llama_context {
      const llama_token * tokens,
                 size_t   n_token_count);
 
+    size_t state_seq_save_incr(const char * session_path, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count);
+    size_t state_seq_load_incr(const char * session_path, llama_seq_id seq_id, const llama_token * prompt_tokens, size_t n_prompt_tokens, size_t min_prefix_tokens);
+
     //
     // perf
     //
