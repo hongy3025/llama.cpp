@@ -695,9 +695,10 @@ static bool test_incr_partial(struct llama_model * model, const struct common_pa
     return true;
 }
 
-// Test 9: GGSD corrupt segment
+// Test 9: GGSD corrupt / missing segment
 // - decode 2500 tokens, save -> 2 segments
-// - flip a byte in the payload of segment 1
+// - flip a byte in the payload of segment 1 -> restore stops at it (1024)
+// - delete segment 1 -> restore stops at the missing file (1024)
 // - corrupt session file -> restore is unaffected (pool semantics, R1)
 static bool test_incr_corrupt(struct llama_model * model, const struct common_params & params) {
     incr_test_cleanup();
@@ -730,22 +731,38 @@ static bool test_incr_corrupt(struct llama_model * model, const struct common_pa
         f.write(&c, 1);
     }
 
+
     auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
     if (n_restored != 1024) {
         LOG_ERR("\n%s: error: expected 1024 tokens restored (stop at corrupt segment), got %zu\n", __func__, n_restored);
         return false;
     }
+    // missing mid-chain segment: restore stops at the first missing file
+    // (corrupt segment above was not rewritten, so segment 1 is present but
+    // bad; delete it and the verified prefix is still 1024)
+    const std::string fname_missing = segment_file_by_index(1);
+    if (fname_missing.empty()) {
+        LOG_ERR("\n%s: error: segment 1 file not found\n", __func__);
+        return false;
+    }
+    std::filesystem::remove(fname_missing);
 
-    // corrupt session file: restore is a no-op
+    const size_t n_restored2 = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
+    if (n_restored2 != 1024) {
+        LOG_ERR("\n%s: error: expected 1024 tokens restored despite missing segment (pool semantics), got %zu\n", __func__, n_restored2);
+        return false;
+    }
+
+    // corrupt session file: restore is unaffected (the session is never read)
     {
         std::ofstream f(session, std::ios::binary);
         f << "garbage";
     }
 
-    const size_t n_restored2 = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
-    if (n_restored2 != 1024) {
-        LOG_ERR("\n%s: error: expected 1024 tokens restored despite corrupt session (pool semantics), got %zu\n", __func__, n_restored2);
+    const size_t n_restored3 = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
+    if (n_restored3 != 1024) {
+        LOG_ERR("\n%s: error: expected 1024 tokens restored despite corrupt session (pool semantics), got %zu\n", __func__, n_restored3);
         return false;
     }
 
