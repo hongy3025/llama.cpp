@@ -2635,7 +2635,7 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     const llama_tokens & tokens = task.slot_action.prompt_tokens;
-                    const size_t n_restored = llama_state_seq_load_incr(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), task.slot_action.min_prefix);
+                    const size_t n_restored = llama_state_seq_load_incr(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), task.slot_action.min_prefix, 0);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;

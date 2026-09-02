@@ -11,6 +11,7 @@
 
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <vector>
@@ -413,7 +414,8 @@ size_t llama_context::state_seq_load_incr(
               llama_seq_id   seq_id,
         const llama_token * prompt_tokens,
               size_t   n_prompt_tokens,
-              size_t   min_prefix_tokens) {
+              size_t   min_prefix_tokens,
+              size_t   n_prefix_valid) {
     if (n_prompt_tokens < GGSD_SEGMENT_TOKENS) {
         return 0;
     }
@@ -462,8 +464,20 @@ size_t llama_context::state_seq_load_incr(
         hashes[k] = ggsd_segment_hash(model_id, kv_params, prev, prompt_tokens + k * GGSD_SEGMENT_TOKENS);
     }
 
+    // differential mode: skip the first k0' segments entirely - the caller
+    // asserts the slot holds valid KV for them (never read, not even stat)
+    size_t k0 = 0;
+    if (n_prefix_valid > 0) {
+        if (kv->seq_pos_min(seq_id) != 0) {
+            LLAMA_LOG_ERROR("%s: differential load requires positions starting at 0 (min pos = %d)\n",
+                    __func__, (int) kv->seq_pos_min(seq_id));
+            return 0;
+        }
+        k0 = std::min<size_t>(n_prefix_valid / GGSD_SEGMENT_TOKENS, n_seg);
+    }
+
     // find the longest chain of segment files matching the prompt
-    size_t n_seg_ok = 0;
+    size_t n_seg_ok = k0;
     for (; n_seg_ok < n_seg; ++n_seg_ok) {
         if (!std::filesystem::exists(ggsd_segment_path(session_path, hashes[n_seg_ok]))) {
             break;
@@ -475,12 +489,18 @@ size_t llama_context::state_seq_load_incr(
         return 0;
     }
 
-    // clear the sequence and restore the matched segments
-    kv->seq_rm(seq_id, -1, -1);
+    // full replay clears the sequence itself; differential mode drops any
+    // cells beyond the aligned boundary so the replayed segments do not
+    // duplicate them (callers that already truncated are unaffected)
+    if (k0 == 0) {
+        kv->seq_rm(seq_id, -1, -1);
+    } else {
+        kv->seq_rm(seq_id, (llama_pos) (k0 * GGSD_SEGMENT_TOKENS), -1);
+    }
 
     size_t n_loaded = 0;
     try {
-        for (size_t k = 0; k < n_seg_ok; ++k) {
+        for (size_t k = k0; k < n_seg_ok; ++k) {
             const std::string fname = ggsd_segment_path(session_path, hashes[k]);
 
             llama_file file(fname.c_str(), "rb");
@@ -549,7 +569,7 @@ size_t llama_context::state_seq_load_incr(
     // the failure are kept - the return value always matches the cache state
     // (review M1). Only an exception (IO failure) unwinds via the catch above.
 
-    return n_loaded * GGSD_SEGMENT_TOKENS;
+    return (n_loaded + k0) * GGSD_SEGMENT_TOKENS;
 }
 
 //
@@ -583,11 +603,12 @@ size_t llama_state_seq_load_incr(
         llama_seq_id seq_id,
         const llama_token * prompt_tokens,
         size_t n_prompt_tokens,
-        size_t min_prefix_tokens) {
+        size_t min_prefix_tokens,
+        size_t n_prefix_valid) {
     ctx->synchronize();
 
     try {
-        return ctx->state_seq_load_incr(session_path, seq_id, prompt_tokens, n_prompt_tokens, min_prefix_tokens);
+        return ctx->state_seq_load_incr(session_path, seq_id, prompt_tokens, n_prompt_tokens, min_prefix_tokens, n_prefix_valid);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading incremental sequence state: %s\n", __func__, err.what());
         return 0;
