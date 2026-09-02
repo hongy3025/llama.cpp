@@ -1811,15 +1811,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+server_prompt_cache::peek_result server_prompt_cache::peek(const server_tokens & tokens_new, const server_tokens & tokens_slot) {
+    peek_result res;
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    res.it = states.end();
+
+    const int lcp_best = tokens_slot.get_common_prefix(tokens_new);
+
+    float f_keep_best = tokens_slot.size() > 0 ? float(lcp_best) / tokens_slot.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-
-    auto it_best = states.end();
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1839,20 +1841,52 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
-            it_best = it;
+            res.it = it;
         }
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    res.f_keep = f_keep_best;
+    res.f_sim  = f_sim_best;
 
-        {
-            auto & data = it_best->data.main;
+    if (res.it != states.end()) {
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", res.f_keep, res.f_sim);
+    }
+
+    return res;
+}
+
+bool server_prompt_cache::consume(peek_result & r, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    if (r.it == states.end()) {
+        return true;
+    }
+
+    SRV_TRC(" - consuming prompt from cache with f_keep = %.3f, f_sim = %.3f\n", r.f_keep, r.f_sim);
+
+    {
+        auto & data = r.it->data.main;
+
+        const size_t size = data.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        if (n != size) {
+            SRV_ERR("failed to restore state with size %zu\n", size);
+
+            return false;
+        }
+
+        data.clear();
+        data.shrink_to_fit();
+    }
+
+    {
+        auto & data = r.it->data.drft;
+
+        if (!data.empty()) {
+            GGML_ASSERT(ctx_dft);
 
             const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+                SRV_WRN("failed to restore state with size %zu\n", size);
 
                 return false;
             }
@@ -1860,30 +1894,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             data.clear();
             data.shrink_to_fit();
         }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
-        }
-
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
     }
+
+    prompt = std::move(r.it->prompt);
+
+    states.erase(r.it);
 
     return true;
 }

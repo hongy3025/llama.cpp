@@ -646,7 +646,18 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    struct peek_result {
+        std::list<server_prompt_cache_state>::iterator it;
+        float f_keep = 0.0f;
+        float f_sim  = 0.0f;
+    };
+
+    // find the best cached prompt for tokens_new without consuming it;
+    // it == states.end() means no candidate beats the slot's own state
+    peek_result peek(const server_tokens & tokens_new, const server_tokens & tokens_slot);
+
+    // move the peeked entry into the slot (set_data + prompt + erase)
+    bool consume(peek_result & r, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
 };

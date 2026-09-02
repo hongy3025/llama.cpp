@@ -277,7 +277,13 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        auto r = prompt_cache.peek(tokens, prompt.tokens);
+        if (r.it == prompt_cache.states.end()) {
+            // no cached prompt beats the slot's own state, nothing to do
+            return true;
+        }
+
+        const bool res = prompt_cache.consume(r, prompt, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
