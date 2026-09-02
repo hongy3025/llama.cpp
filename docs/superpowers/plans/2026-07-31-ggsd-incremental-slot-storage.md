@@ -1,3 +1,12 @@
+> **AMENDED 2026-09-02:** this plan is partially superseded by the design
+> review remediation (docs/plans/2026-09-02-ggsd-remediation.md) and the
+> amended spec (docs/superpowers/specs/2026-07-31-ggsd-incremental-slot-storage-design.md).
+> Key deltas vs. the steps below: restore uses segment-pool semantics (no
+> session-file dependency, no n_segments cap); fork detection is
+> file-existence based and never shortens a persisted chain; SWA caches,
+> n_pos_per_embd != 1, shifted positions, and mtmd sequences are rejected
+> explicitly. Task numbers in the handoff refer to this plan.
+
 # GGSD Incremental Slot Storage Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
