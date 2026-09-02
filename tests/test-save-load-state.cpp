@@ -893,6 +893,12 @@ static bool test_incr_differential(struct llama_model * model, const struct comm
         return false;
     }
 
+    if (!decode_tokens(ctx3.get(), tokens, n_restored2, tokens.size(), 0)) {
+        return false;
+    }
+    if (!compare_generation(model, params, ctx3.get(), (int) tokens.size(), expected)) {
+        return false;
+    }
     // full-replay mode sees the deleted head and restores nothing
     auto ctx4 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored3 = llama_state_seq_load_incr(ctx4.get(), session.c_str(), 0,

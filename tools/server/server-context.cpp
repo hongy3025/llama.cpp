@@ -1634,9 +1634,9 @@ private:
                 return true;
             }
 
-            // load_incr already truncated the sequence even when it rejects
-            // the first segment: drop the stale prompt too so the fallback
-            // prefill starts from a consistent empty state
+            // load_incr truncates the sequence only when it proceeds; clear
+            // unconditionally so rejection paths that leave stale KV behind
+            // are covered too, keeping the fallback prefill consistent
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
             slot.prompt_clear();
         }

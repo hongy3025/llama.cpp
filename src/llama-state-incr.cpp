@@ -610,7 +610,6 @@ size_t llama_context::state_seq_load_incr_estimate(
     return n_restored < min_prefix_tokens ? 0 : n_restored;
 }
 
-
 //
 // C API
 //

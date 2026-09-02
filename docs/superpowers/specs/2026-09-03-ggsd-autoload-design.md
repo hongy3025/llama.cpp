@@ -111,12 +111,9 @@ size_t llama_state_seq_load_incr(
 - `n_prefix_valid == 0`: current semantics - the sequence is treated as
   empty; replay starts at the chain head. Used by the manual endpoint.
 - If `m` is not a multiple of 1024, the implementation floors it internally
-  (`k0' = m / 1024`); the caller must truncate the sequence to the same
-  boundary `floor(m / 1024) * 1024` before the call, otherwise the replayed
-  segments overlap cells the slot still holds.
-   Truncation is the caller's responsibility: the C API never mutates the
-   sequence beyond appending cells. The server calls
-   `llama_memory_seq_rm(mem, seq_id, m_aligned, -1)` before the load.
+  (`k0' = m / 1024`). In differential mode the load truncates the sequence
+  itself: it removes cells `[k0' * 1024, -1)` before the replay, so the
+  caller may rely on that instead of pre-truncating.
   1. Guards: `seq_pos_min(seq_id) == 0` (positions must not be shifted),
      `m >= GGSD_SEGMENT_TOKENS` (less than a segment has nothing to skip),
      SWA / `n_pos_per_embd != 1` rejected as today.
@@ -127,12 +124,13 @@ size_t llama_state_seq_load_incr(
      longest chain prefix present on disk times 1024 (M1 semantics: the
      return always matches the restored coverage).
 - If `m` is not a multiple of 1024, the implementation floors it internally
-  (`k0' = m / 1024`); the caller is expected to have truncated the sequence
-  to the same aligned boundary.
+  (`k0' = m / 1024`); the caller may rely on the load truncating to the same
+  aligned boundary.
 
-Truncation is the caller's responsibility: the C API never mutates the
-sequence beyond appending cells. The server calls
-`llama_memory_seq_rm(mem, seq_id, m_aligned, -1)` before the load.
+Truncation in differential mode is performed by the load itself
+(`llama_memory_seq_rm(mem, seq_id, k0' * 1024, -1)`). Callers that
+pre-truncate to the same boundary remain compatible (the removal is
+idempotent).
 
 `llama_context::state_seq_load_incr` (member, `llama-context.h`) gains the
 same parameter.
