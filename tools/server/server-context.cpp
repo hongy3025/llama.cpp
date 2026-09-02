@@ -1616,7 +1616,6 @@ private:
 
             size_t n_restored = 0;
             if (lcp_complete && m_aligned >= 1024) {
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, m_aligned, -1);
                 n_restored = llama_state_seq_load_incr(ctx_tgt, params_base.slot_save_path.c_str(),
                         slot.id, task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX, m_aligned);
             } else {
@@ -1635,11 +1634,11 @@ private:
                 return true;
             }
 
-            if (m_aligned > 0) {
-                // differential load fell short: drop the partially restored
-                // state so the prefill starts clean
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
-            }
+            // load_incr already truncated the sequence even when it rejects
+            // the first segment: drop the stale prompt too so the fallback
+            // prefill starts from a consistent empty state
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+            slot.prompt_clear();
         }
 
         if (n_cache >= n_best) {
