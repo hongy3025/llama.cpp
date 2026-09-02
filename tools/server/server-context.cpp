@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-context.h" // for state_seq_load_incr_estimate (GGSD autoload)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -34,6 +35,9 @@
 #endif
 #include <windows.h>
 #endif
+
+static constexpr size_t GGSD_AUTOLOAD_MIN_PREFIX = 1024; // at least one full segment
+static constexpr size_t GGSD_AUTOLOAD_MARGIN     = 256;  // must beat the runner-up by this much
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -1286,6 +1290,11 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        if (params_base.slot_incr_autoload && params_base.slot_save_path.empty()) {
+            SRV_WRN("%s", "--slot-incr-autoload requires --slot-save-path, disabling\n");
+            params_base.slot_incr_autoload = false;
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
@@ -1559,6 +1568,14 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
+                if (params_base.slot_incr_autoload && !task.tokens.has_mtmd && !task.tokens.get_tokens().empty()) {
+                    if (autoload_ggsd(*ret, task)) {
+                        prompt_cache->update();
+                        SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                        return ret;
+                    }
+                }
+
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
@@ -1570,6 +1587,67 @@ private:
         }
 
         return ret;
+    }
+
+    // three-source arbitration for GGSD (spec: 2026-09-03-ggsd-autoload-design.md).
+    // returns true if the slot was filled from the segment pool
+    bool autoload_ggsd(server_slot & slot, const server_task & task) {
+        const auto & task_tokens = task.tokens.get_tokens();
+
+        const size_t n_slot = slot.prompt.tokens.get_common_prefix(task.tokens);
+
+        auto r_cache = prompt_cache->peek(task.tokens, slot.prompt.tokens);
+        const size_t n_cache = r_cache.it != prompt_cache->states.end()
+            ? (size_t) r_cache.it->prompt.tokens.get_common_prefix(task.tokens) : 0;
+
+        const size_t n_ggsd = ctx_tgt == nullptr ? 0 :
+            ctx_tgt->state_seq_load_incr_estimate(params_base.slot_save_path.c_str(), slot.id,
+                    task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX);
+
+        const size_t n_best = std::max({n_slot, n_cache, n_ggsd});
+        if (n_best < GGSD_AUTOLOAD_MIN_PREFIX) {
+            return false;
+        }
+
+        if (n_ggsd >= n_best && n_ggsd - std::max(n_slot, n_cache) >= GGSD_AUTOLOAD_MARGIN) {
+            size_t m_aligned = std::min(n_slot, n_ggsd) / 1024 * 1024;
+            const bool lcp_complete = n_slot > 0 && n_slot == slot.prompt.tokens.size()
+                && slot.prompt.tokens.get_tokens().size() >= m_aligned;
+
+            size_t n_restored = 0;
+            if (lcp_complete && m_aligned >= 1024) {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, m_aligned, -1);
+                n_restored = llama_state_seq_load_incr(ctx_tgt, params_base.slot_save_path.c_str(),
+                        slot.id, task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX, m_aligned);
+            } else {
+                m_aligned = 0;
+                n_restored = llama_state_seq_load_incr(ctx_tgt, params_base.slot_save_path.c_str(),
+                        slot.id, task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX, 0);
+            }
+
+            if (n_restored >= GGSD_AUTOLOAD_MIN_PREFIX) {
+                slot.prompt.tokens = server_tokens(
+                        llama_tokens(task_tokens.begin(), task_tokens.begin() + n_restored),
+                        /* has_mtmd = */ false);
+                slot.prompt.checkpoints.clear();
+                SRV_INF("slot %d: autoloaded %zu GGSD tokens (slot %zu, cache %zu)\n",
+                        slot.id, n_restored, n_slot, n_cache);
+                return true;
+            }
+
+            if (m_aligned > 0) {
+                // differential load fell short: drop the partially restored
+                // state so the prefill starts clean
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+            }
+        }
+
+        if (n_cache >= n_best) {
+            const bool res = prompt_cache->consume(r_cache, slot.prompt, ctx_tgt, ctx_dft, slot.id);
+            return res;
+        }
+
+        return false;
     }
 
     // return true if at least one slot has been cleared
