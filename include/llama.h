@@ -897,9 +897,13 @@ extern "C" {
     //
     // Save the KV state of a sequence as a chain of 1024-token segments,
     // content-addressed by a hash of (model, kv params, previous hash, tokens).
-    // Segments shared with previous saves are reused (append / fork semantics).
-    // Returns the number of segments in the session chain after the save,
-    // 0 if nothing changed, or -1 on error.
+    // Segments already on disk are reused (append / fork semantics); fork
+    // detection is file-based, so KV eviction never invalidates a persisted
+    // chain. Returns the number of segments the session chain covers after
+    // the save (not the number newly written), or -1 on error.
+    // Rejected with -1: SWA caches, n_pos_per_embd != 1, sequence positions
+    // not starting at 0 (checked only when the head segment must be written),
+    // or a KV head neither on disk nor in the cache.
     LLAMA_API int32_t llama_state_seq_save_incr(
             struct llama_context * ctx,
                       const char * session_path,
@@ -907,8 +911,11 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
-    // Restore the aligned prefix of the session chain matching the prompt.
-    // Returns the number of tokens restored, or 0 if no match / error.
+    // Restore the aligned prefix of the prompt's hash chain by matching
+    // content-addressed segment files in the directory of session_path
+    // (segment-pool semantics: segments saved by any session or sequence
+    // match; the session file itself is not read). Returns the number of
+    // tokens restored, or 0 if no match / error.
     LLAMA_API size_t llama_state_seq_load_incr(
             struct llama_context * ctx,
                       const char * session_path,

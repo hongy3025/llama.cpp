@@ -217,7 +217,17 @@ size_t llama_context::state_seq_save_incr(
         return 0;
     }
 
+    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        LLAMA_LOG_ERROR("%s: incremental state save does not support SWA KV caches\n", __func__);
+        return (size_t) -1;
+    }
+
     const uint32_t n_pos_per_embd = model.hparams.n_pos_per_embd();
+
+    if (n_pos_per_embd != 1) {
+        LLAMA_LOG_ERROR("%s: incremental state save requires n_pos_per_embd == 1 (got %u)\n", __func__, n_pos_per_embd);
+        return (size_t) -1;
+    }
 
     // model identity: arch name + kv cache parameters, both part of the segment hash
     const std::string model_id = llm_arch_name(model.arch);
@@ -225,7 +235,9 @@ size_t llama_context::state_seq_save_incr(
                                   std::string(ggml_type_name(kv->type_v())) + "|" +
                                   std::to_string(n_pos_per_embd);
 
-    // read the session file; a corrupt or missing session starts a new chain
+    // read the session file (save-side hint only: last known chain length);
+    // a corrupt or missing session simply starts a new chain. Restore does not
+    // depend on this file - see the segment-pool semantics in the spec.
     uint32_t n_segments = 0;
     std::string tail_hash_read;
     if (std::filesystem::exists(session_path)) {
@@ -271,17 +283,25 @@ size_t llama_context::state_seq_save_incr(
         hashes[k] = ggsd_segment_hash(model_id, kv_params, prev, tokens + k * GGSD_SEGMENT_TOKENS);
     }
 
-    // find the fork point: the first segment that is not already saved,
-    // i.e. missing on disk or missing from the KV cache (eviction case)
+    // find the fork point: the first segment missing on disk. The KV cache is
+    // deliberately NOT consulted here - already-persisted segments stay valid
+    // and reachable even after the corresponding cells are evicted (R2).
     size_t k0 = 0;
     for (; k0 < std::min<size_t>(n_segments, n_seg); ++k0) {
-        const llama_pos pos_begin = (llama_pos) ( k0       * GGSD_SEGMENT_TOKENS * n_pos_per_embd);
-        const llama_pos pos_end   = (llama_pos) ((k0 + 1) * GGSD_SEGMENT_TOKENS * n_pos_per_embd);
-
-        if (!std::filesystem::exists(ggsd_segment_path(session_path, hashes[k0])) ||
-                kv->count_cells_range(seq_id, pos_begin, pos_end) != GGSD_SEGMENT_TOKENS) {
+        if (!std::filesystem::exists(ggsd_segment_path(session_path, hashes[k0]))) {
             break;
         }
+    }
+
+    // position guard: only when the head segment must be written. If all
+    // segments are already on disk (k0 == n_seg), eviction or an empty cache
+    // is irrelevant - the chain is preserved with zero IO (R2/R3). Correctness
+    // of written segments relies on the caller passing tokens that correspond
+    // to positions 0..n-1 of the sequence's cells.
+    if (k0 < n_seg && kv->seq_pos_min(seq_id) != 0) {
+        LLAMA_LOG_ERROR("%s: cannot write the head segment: sequence positions do not start at 0 (min pos = %d)\n",
+                __func__, (int) kv->seq_pos_min(seq_id));
+        return (size_t) -1;
     }
 
     // write new segments starting at the fork point
@@ -291,8 +311,17 @@ size_t llama_context::state_seq_save_incr(
         const llama_pos pos_end   = (llama_pos) ((k + 1) * GGSD_SEGMENT_TOKENS * n_pos_per_embd);
 
         if (kv->count_cells_range(seq_id, pos_begin, pos_end) != GGSD_SEGMENT_TOKENS) {
-            // partial KV cache: stop at the contiguous prefix
+            // partial KV cache: stop writing at the contiguous prefix
             break;
+        }
+
+        const std::string fname = ggsd_segment_path(session_path, hashes[k]);
+
+        if (std::filesystem::exists(fname)) {
+            // already persisted by a previous save (possibly from another
+            // sequence computing the same chain); content addressing makes the
+            // data equivalent - see the FP nondeterminism note in the spec
+            continue;
         }
 
         // measure the payload size
@@ -300,7 +329,6 @@ size_t llama_context::state_seq_save_incr(
         kv->state_write_range(io_dummy, seq_id, pos_begin, pos_end);
         const uint64_t payload_size = io_dummy.n_bytes();
 
-        const std::string fname     = ggsd_segment_path(session_path, hashes[k]);
         const std::string fname_tmp = fname + ".tmp";
 
         {
@@ -346,22 +374,35 @@ size_t llama_context::state_seq_save_incr(
         ++n_written;
     }
 
-    const uint32_t n_chain = (uint32_t) (k0 + n_written);
+    // final chain length: the longest prefix of the hash chain present on disk.
+    // This is the authoritative value - it counts persisted segments regardless
+    // of whether their KV cells are still in the cache (R2), and it stops at a
+    // missing file even when the write loop was cut short by evicted cells.
+    size_t n_chain = 0;
+    for (; n_chain < n_seg; ++n_chain) {
+        if (!std::filesystem::exists(ggsd_segment_path(session_path, hashes[n_chain]))) {
+            break;
+        }
+    }
+
     if (n_chain == 0) {
-        LLAMA_LOG_ERROR("%s: KV cache is missing the head of the sequence (pos [0, %d)), nothing saved\n",
+        LLAMA_LOG_ERROR("%s: KV cache is missing the head of the sequence (pos [0, %d)) and no head segment exists, nothing saved\n",
                 __func__, (int) (GGSD_SEGMENT_TOKENS * n_pos_per_embd));
         return (size_t) -1;
     }
 
-    // rewrite the session file when the chain changed
-    const std::string tail_hash = hashes[n_chain - 1];
-    if (n_chain != n_segments || tail_hash != tail_hash_read) {
+    LLAMA_LOG_INFO("%s: wrote %zu new segment(s), session chain covers %zu segment(s)\n",
+            __func__, n_written, n_chain);
+
+    // rewrite the session file when the chain changed (length or tail hash -
+    // an equal-length re-fork keeps n_chain but changes the tail)
+    if ((uint32_t) n_chain != n_segments || hashes[n_chain - 1] != tail_hash_read) {
         llama_file file(session_path, "wb");
 
         file.write_raw(GGSD_MAGIC, sizeof(GGSD_MAGIC));
         file.write_u32(GGSD_VERSION);
-        file.write_raw(tail_hash.c_str(), tail_hash.size());
-        file.write_u32(n_chain);
+        file.write_raw(hashes[n_chain - 1].c_str(), hashes[n_chain - 1].size());
+        file.write_u32((uint32_t) n_chain);
     }
 
     return n_chain;
@@ -376,9 +417,6 @@ size_t llama_context::state_seq_load_incr(
     if (n_prompt_tokens < GGSD_SEGMENT_TOKENS) {
         return 0;
     }
-    if (!std::filesystem::exists(session_path)) {
-        return 0;
-    }
 
     auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
     if (kv == nullptr) {
@@ -386,26 +424,21 @@ size_t llama_context::state_seq_load_incr(
         return 0;
     }
 
-    // read the session file
-    uint32_t n_segments = 0;
-    {
-        llama_file file(session_path, "rb");
-
-        char magic[4];
-        file.read_raw(magic, 4);
-
-        const uint32_t version = file.read_u32();
-
-        char tail_hash[GGSD_HASH_HEX_LEN];
-        file.read_raw(tail_hash, sizeof(tail_hash));
-
-        n_segments = file.read_u32();
-
-        if (memcmp(magic, GGSD_MAGIC, 4) != 0 || version != GGSD_VERSION) {
-            LLAMA_LOG_ERROR("%s: invalid session file %s\n", __func__, session_path);
-            return 0;
-        }
+    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        LLAMA_LOG_ERROR("%s: incremental state load does not support SWA KV caches\n", __func__);
+        return 0;
     }
+
+    if (model.hparams.n_pos_per_embd() != 1) {
+        LLAMA_LOG_ERROR("%s: incremental state load requires n_pos_per_embd == 1 (got %u)\n",
+                __func__, model.hparams.n_pos_per_embd());
+        return 0;
+    }
+
+    // segment-pool semantics: the session file is not consulted. The prompt's
+    // hash chain is matched directly against content-addressed segment files in
+    // the directory of session_path, so prefixes persisted by any session (and
+    // any sequence) are reusable (G2 / remediation R1).
 
     const uint32_t n_pos_per_embd = model.hparams.n_pos_per_embd();
 
@@ -414,7 +447,7 @@ size_t llama_context::state_seq_load_incr(
                                   std::string(ggml_type_name(kv->type_v())) + "|" +
                                   std::to_string(n_pos_per_embd);
 
-    const size_t n_seg = std::min<size_t>(n_segments, n_prompt_tokens / GGSD_SEGMENT_TOKENS);
+    const size_t n_seg = n_prompt_tokens / GGSD_SEGMENT_TOKENS;
 
     // hash chain of the prompt prefix
     std::vector<std::string> hashes(n_seg);
@@ -512,10 +545,9 @@ size_t llama_context::state_seq_load_incr(
         throw;
     }
 
-    if (n_loaded != n_seg_ok) {
-        // undo the partial restore
-        kv->seq_rm(seq_id, -1, -1);
-    }
+    // stop-at-first-corrupt semantics: segments verified and replayed before
+    // the failure are kept - the return value always matches the cache state
+    // (review M1). Only an exception (IO failure) unwinds via the catch above.
 
     return n_loaded * GGSD_SEGMENT_TOKENS;
 }

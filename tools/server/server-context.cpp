@@ -2581,6 +2581,12 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    if (slot->prompt.tokens.has_mtmd) {
+                        // multimodal sequences contain LLAMA_TOKEN_NULL placeholders
+                        // that the text-only hash chain cannot represent
+                        send_error(task, "save_incr does not support multimodal (mtmd) sequences", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
 
                     const int64_t t_start = ggml_time_us();
 
@@ -2635,11 +2641,12 @@ private:
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
                     // keep only the restored prefix in the prompt cache;
-                    // the remainder is re-processed by the next completion
-                    slot->prompt.tokens.clear();
-                    if (n_restored > 0) {
-                        slot->prompt.tokens.insert(llama_tokens(tokens.begin(), tokens.begin() + n_restored));
-                    }
+                    // the remainder is re-processed by the next completion.
+                    // rebuilt from plain text tokens: has_mtmd must be reset
+                    // so a restored slot can be saved again (review m3)
+                    slot->prompt.tokens = server_tokens(n_restored > 0
+                            ? llama_tokens(tokens.begin(), tokens.begin() + n_restored)
+                            : llama_tokens(), /* has_mtmd = */ false);
 
                     auto res = std::make_unique<server_task_result_slot_incr>();
                     res->id       = task.id;

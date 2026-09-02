@@ -617,9 +617,14 @@ static bool test_incr_fork(struct llama_model * model, const struct common_param
 
 // Test 8: GGSD partial KV
 // - decode 3000 tokens, save -> 2 segments
-// - evict cells [1024, 3000), save -> chain shrinks to 1 segment
-// - restore with the full prompt -> 1024 tokens
-// - evict the head cells [0, 1024), save -> error (-1)
+// - evict cells [1024, 3000), save -> chain is preserved (files on disk stay
+//   valid regardless of KV eviction; R2) and nothing new is written
+// - restore with the full prompt -> 2048 tokens (both segments are on disk)
+// - evict the head cells [0, 1024), save to the original session -> still 2
+//   (zero writes; the head file on disk keeps the chain alive, R2)
+// - evict part of the head cells [512, 1024) in a fresh context, save to a
+//   fresh session -> error (-1): the head segment can neither be loaded from
+//   disk (no file) nor written (incomplete cells) - the R3 head-missing rule
 static bool test_incr_partial(struct llama_model * model, const struct common_params & params) {
     incr_test_cleanup();
 
@@ -641,22 +646,36 @@ static bool test_incr_partial(struct llama_model * model, const struct common_pa
     llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 1024, 3000);
 
     n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
-    if (n_segments != 1) {
-        LOG_ERR("\n%s: error: expected chain to shrink to 1 segment, got %d\n", __func__, n_segments);
+    if (n_segments != 2) {
+        LOG_ERR("\n%s: error: expected chain to be preserved after eviction, got %d\n", __func__, n_segments);
         return false;
     }
 
     auto ctx2 = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
-    if (n_restored != 1024) {
-        LOG_ERR("\n%s: error: expected 1024 tokens restored, got %zu\n", __func__, n_restored);
+    if (n_restored != 2048) {
+        LOG_ERR("\n%s: error: expected 2048 tokens restored, got %zu\n", __func__, n_restored);
+        return false;
+    }
+    // evict the whole head: the chain on disk is untouched, save is a no-op (R2)
+    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 0, 1024);
+
+    n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
+    if (n_segments != 2) {
+        LOG_ERR("\n%s: error: expected chain to be preserved after head eviction, got %d\n", __func__, n_segments);
         return false;
     }
 
-    // evict the head: save must fail
-    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 0, 1024);
+    // R3 head-missing rule: head segment present in the KV cache only
+    // partially (pos base still 0), no file on disk, cannot be written
+    auto ctx3 = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    if (!decode_tokens(ctx3.get(), tokens, 0, tokens.size(), 0)) {
+        return false;
+    }
+    llama_memory_seq_rm(llama_get_memory(ctx3.get()), 0, 512, 1024);
 
-    const int32_t n_segments_err = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
+    const std::string session_fresh = session_path("session_partial_fresh.bin");
+    const int32_t n_segments_err = llama_state_seq_save_incr(ctx3.get(), session_fresh.c_str(), 0, tokens.data(), tokens.size());
     if (n_segments_err != -1) {
         LOG_ERR("\n%s: error: expected save to fail with head missing, got %d\n", __func__, n_segments_err);
         return false;
@@ -669,8 +688,7 @@ static bool test_incr_partial(struct llama_model * model, const struct common_pa
 // Test 9: GGSD corrupt segment
 // - decode 2500 tokens, save -> 2 segments
 // - flip a byte in the payload of segment 1
-// - restore -> stops at the corrupt segment (1024 tokens) with a warning
-// - corrupt session file -> restore returns 0
+// - corrupt session file -> restore is unaffected (pool semantics, R1)
 static bool test_incr_corrupt(struct llama_model * model, const struct common_params & params) {
     incr_test_cleanup();
 
@@ -716,8 +734,8 @@ static bool test_incr_corrupt(struct llama_model * model, const struct common_pa
     }
 
     const size_t n_restored2 = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
-    if (n_restored2 != 0) {
-        LOG_ERR("\n%s: error: expected 0 tokens restored from corrupt session, got %zu\n", __func__, n_restored2);
+    if (n_restored2 != 1024) {
+        LOG_ERR("\n%s: error: expected 1024 tokens restored despite corrupt session (pool semantics), got %zu\n", __func__, n_restored2);
         return false;
     }
 
