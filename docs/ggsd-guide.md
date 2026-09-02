@@ -19,11 +19,20 @@ GGSD 改为把 KV 状态切分成固定 1024-token 的段(segment),每段只写�
 
 ### 1.2 新增配置与参数
 
-**没有新增服务端参数。** GGSD 复用现有的 `--slot-save-path PATH` 目录(与经典槽位保存共用同一目录)。该目录必须已存在;未提供此参数则功能禁用:
+**服务端参数:** GGSD 复用现有的 `--slot-save-path PATH` 目录(与经典槽位保存共用同一目录)。该目录必须已存在;未提供此参数则功能禁用:
 
 ```
 llama-server -m model.gguf --slot-save-path saves
 ```
+
+新增可选开关:
+
+- `--slot-incr-autoload` - 默认关闭;需要 `--slot-save-path`。开启后,服务端在为请求挑选槽位时,会自动把磁盘 GGSD 段池中与请求 prompt 匹配的前缀恢复进该槽位(见 1.3 与 1.6),客户端无需显式调用 `restore_incr`。
+
+自动恢复使用两个固定的编译期常量(不可通过命令行调整):
+
+- `GGSD_AUTOLOAD_MIN_PREFIX = 1024` - 自动恢复的最小前缀 token 数(至少一个完整段);
+- `GGSD_AUTOLOAD_MARGIN = 256` - GGSD 候选必须领先次优来源(槽内 KV cache / RAM prompt cache)至少这么多 token 才会胜出。
 
 GGSD 的所有产物都在这一个目录里:
 
@@ -36,6 +45,8 @@ saves/
 ### 1.3 HTTP API
 
 在现有 slots 路由上新增两个 action,均为同步调用。
+
+若启用 `--slot-incr-autoload`(见 1.2),服务端会在槽位选择阶段自动恢复与请求 prompt 匹配的 GGSD 磁盘前缀,无需客户端调用。下面两个 action 的语义不受该开关影响,`restore_incr` 仍按原样工作。
 
 #### 保存
 
@@ -154,6 +165,8 @@ session 文件每个固定 44 字节。
 | 恢复,匹配前缀 < min_prefix | 无操作,恢复 0 token |
 | 恢复,链中途缺段或损坏 | 就此停止;已验证前缀保持已恢复状态 |
 | 跨模型 / 跨 KV 配置恢复 | 自然不匹配(身份包含 arch 与 KV 类型) |
+| 自动恢复开启,前缀匹配已保存的段 | 槽位选择阶段自动恢复,prefill 只处理剩余部分 |
+| 自动恢复开启,GGSD 胜出但中途缺段 | 已验证前缀保持已恢复状态,剩余部分正常 prefill |
 
 显式拒绝的场景:
 
