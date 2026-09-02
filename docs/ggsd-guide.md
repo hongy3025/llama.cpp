@@ -1,137 +1,107 @@
-# GGSD: Incremental Slot Storage - User Guide and Technical Reference
+# GGSD:增量式槽位存储 - 使用手册与技术原理
 
-GGSD (incremental slot storage) adds content-addressed, incremental KV-cache
-save/restore to llama.cpp. Long conversations can be saved repeatedly at
-near-zero cost, and a restored prompt can reuse saved KV state from *any*
-previous session, as long as the token prefix matches.
+GGSD(增量式槽位存储)为 llama.cpp 增加了内容寻址的增量式 KV cache 保存/恢复能力。长对话可以反复保存而代价接近于零;只要 token 前缀匹配,恢复时可以复用*任意*先前 session 保存的 KV 状态。
 
-Design spec: `docs/superpowers/specs/2026-07-31-ggsd-incremental-slot-storage-design.md`
+设计文档:`docs/superpowers/specs/2026-07-31-ggsd-incremental-slot-storage-design.md`
 
 ---
 
-## Part 1: User Perspective
+## 第一部分:使用者视角
 
-### 1.1 What problem does it solve
+### 1.1 解决什么问题
 
-The existing `/slots/{id}/save` / `restore` endpoints (GGSQ v2) write a full
-snapshot of the slot state on every call: for a long conversation that is
-hundreds of MB per save, even when only a few tokens changed.
+现有的 `/slots/{id}/save` / `restore` 端点(GGSQ v2)每次调用都会写入整个槽位状态的完整快照:对长对话来说,即使只有几个 token 变化,每次保存也要写数百 MB。
 
-GGSD instead splits the KV state into fixed 1024-token segments. Each segment
-is written once and never rewritten:
+GGSD 改为把 KV 状态切分成固定 1024-token 的段(segment),每段只写一次、永不重写:
 
-- **Consecutive saves are cheap.** Saving after generating a few tokens costs
-  microseconds when no 1024-token boundary was crossed.
-- **Prefix reuse across sessions and slots.** On restore, the prompt's saved
-  prefix is replayed from disk and only the remainder is prefilled. The
-  session that produced the prefix does not matter - any session saved to the
-  same directory can be reused.
+- **连续保存很便宜。** 只要没有跨过 1024-token 边界,生成几个 token 后再保存只需微秒级。
+- **跨 session、跨槽位的前缀复用。** 恢复时,从磁盘重放 prompt 已保存的前缀,只对剩余部分做 prefill。产生该前缀的 session 无关紧要 - 保存在同一目录下的任何 session 都可复用。
 
-### 1.2 New configuration and parameters
+### 1.2 新增配置与参数
 
-**No new server flags.** GGSD reuses the existing `--slot-save-path PATH`
-directory (the same directory used by the classic slot save). It must exist
-and is disabled unless provided:
+**没有新增服务端参数。** GGSD 复用现有的 `--slot-save-path PATH` 目录(与经典槽位保存共用同一目录)。该目录必须已存在;未提供此参数则功能禁用:
 
 ```
 llama-server -m model.gguf --slot-save-path saves
 ```
 
-All GGSD artifacts live in this single directory:
+GGSD 的所有产物都在这一个目录里:
 
 ```
 saves/
-  seg_<hash>.bin          # one KV segment per 1024 tokens
-  session_<name>.bin      # tiny save-side hint (chain tail, 44 bytes)
+  seg_<hash>.bin          # 每 1024 token 一个 KV 段
+  session_<name>.bin      # 极小的保存侧提示文件(链尾哈希,44 字节)
 ```
 
 ### 1.3 HTTP API
 
-Two new actions on the existing slots route. Both are synchronous.
+在现有 slots 路由上新增两个 action,均为同步调用。
 
-#### Save
+#### 保存
 
 ```
 POST /slots/{id_slot}?action=save_incr
 { "filename": "my-session" }
 ```
 
-Response:
+响应:
 
 ```json
 { "id_slot": 0, "filename": "my-session",
   "n_segments": 3, "n_tokens": 3072, "t_ms": 12.4 }
 ```
 
-- `n_segments` / `n_tokens` describe the **whole chain on disk after the
-  save**, not the amount written by this call. A repeated save with no new
-  full segment returns the same numbers with `t_ms` near zero.
-- `filename` is validated with the server's filename rules; it maps to
-  `session_<filename>.bin`.
+- `n_segments` / `n_tokens` 描述的是**本次保存之后磁盘上整条链的覆盖量**,不是本次调用写入的量。没有跨出新的完整段时,重复保存返回相同数字且 `t_ms` 接近零。
+- `filename` 经过服务端文件名校验,对应磁盘上的 `session_<filename>.bin`。
 
-#### Restore
+#### 恢复
 
 ```
 POST /slots/{id_slot}?action=restore_incr
 { "filename": "my-session", "prompt": "...", "min_prefix": 64 }
 ```
 
-Response:
+响应:
 
 ```json
 { "id_slot": 0, "filename": "my-session",
   "n_tokens_restored": 1024, "t_ms": 65.5 }
 ```
 
-- `prompt` is tokenized text-only. Its hash chain is matched against
-  `seg_<hash>.bin` files in the save directory. `filename` is only used to
-  locate the directory - the session file itself is never read.
-- Restored tokens are floor-aligned to 1024. The slot's prompt is set to the
-  restored prefix and the next `/completion` continues from it; only the
-  tokens after the prefix are prefilled.
-- `min_prefix` (optional, default 64) is the minimum restored length. If the
-  match is shorter, nothing is restored and the request returns
-  `n_tokens_restored: 0`; the prompt is then processed by a full prefill.
-  Setting `min_prefix` above the expected match is how you express "restore
-  only if it is worth it".
+- `prompt` 按纯文本分词。其哈希链与保存目录中的 `seg_<hash>.bin` 文件进行匹配;`filename` 仅用于定位目录 - session 文件本身永远不会被读取。
+- 恢复的 token 数向下对齐到 1024。槽位的 prompt 被置为已恢复前缀,下一次 `/completion` 从这里继续;只有前缀之后的 token 需要重新 prefill。
+- `min_prefix`(可选,默认 64)是最小恢复长度。匹配不足时不恢复任何内容,返回 `n_tokens_restored: 0`,prompt 走完整 prefill。把 `min_prefix` 设得高于预期匹配长度,即可表达"值得恢复才恢复"。
 
-#### Typical workflow
+#### 典型工作流
 
 ```sh
-# 1. run a long completion
+# 1. 跑一段长生成
 curl http://localhost:8080/completion -d '{"prompt": "<long text>", "n_predict": 512}'
 
-# 2. checkpoint the slot (call as often as you like)
+# 2. 给槽位做检查点(想调多频繁就调多频繁)
 curl http://localhost:8080/slots/0?action=save_incr -d '{"filename": "story"}'
 
-# 3. later / in another process: restore the prefix and continue
+# 3. 稍后 / 在另一个进程里:恢复前缀并继续
 curl http://localhost:8080/slots/0?action=restore_incr \
      -d '{"filename": "story", "prompt": "<same long text>", "min_prefix": 1024}'
 ```
 
-Cross-session reuse: save session `A`, then call `restore_incr` with
-`filename: "B"` (never saved) and A's prompt - the prefix still restores,
-because the segment pool matches by content, not by session name.
+跨 session 复用:保存 session `A` 后,用 `filename: "B"`(从未保存过)和 A 的 prompt 调 `restore_incr` - 前缀照样能恢复,因为段池按内容匹配,与 session 名无关。
 
 ### 1.4 C API
 
-For applications embedding llama.cpp (`llama_state_seq_save_incr` /
-`llama_state_seq_load_incr` in `llama.h`, implementation in
-`src/llama-state-incr.cpp`):
+对内嵌 llama.cpp 的应用(`llama.h` 中的 `llama_state_seq_save_incr` / `llama_state_seq_load_incr`,实现位于 `src/llama-state-incr.cpp`):
 
 ```c
-// Returns the chain length after the save (segments, not newly written),
-// or -1 on error.
+// 返回保存之后的链长(段数,而非本次新写的段数),出错返回 -1。
 int32_t llama_state_seq_save_incr(
         struct llama_context * ctx,
-        const char * session_path,   // path of the session file; its parent
-                                     // directory is the segment pool
+        const char * session_path,   // session 文件路径;其父目录即段池
         llama_seq_id   seq_id,
-        const llama_token * tokens,  // full token list of the sequence,
-        size_t   n_token_count);     // positions must start at 0
+        const llama_token * tokens,  // 序列的完整 token 列表,
+        size_t   n_token_count);     // 位置必须从 0 开始
 
-// Returns the number of tokens restored (floor-aligned to 1024),
-// or 0 if no match / error.
+// 返回恢复的 token 数(向下对齐到 1024),无匹配或出错返回 0。
 size_t llama_state_seq_load_incr(
         struct llama_context * ctx,
         const char * session_path,
@@ -141,196 +111,132 @@ size_t llama_state_seq_load_incr(
         size_t   min_prefix_tokens);
 ```
 
-Both share the caller's synchronization requirements of the existing
-`llama_state_seq_*` API (call `llama_synchronize()` / decode on the same
-thread as usual).
+两者的同步要求与现有 `llama_state_seq_*` API 相同(照常在同一线程上调用 `llama_synchronize()` / decode)。
 
-### 1.5 Disk usage
+### 1.5 磁盘占用
 
-Per segment file (1024 tokens):
-
-header      ~110 bytes   magic, version, seg_index, prev_hash, payload
-                         size, payload hash, model_id, kv_params
-tokens      4 KiB        the 1024 token ids (i32)
-payload     depends      the KV cells for those 1024 tokens
-```
-
-The payload dominates. Per segment it is approximately:
+每个段文件(1024 token):
 
 ```
-n_layer x n_embd_kv x 2 (K and V) x sizeof(type_k/v) x n_streams
+header      ~110 字节    magic、version、seg_index、prev_hash、payload
+                         size、payload hash、model_id、kv_params
+tokens      4 KiB        该 1024 个 token id(i32)
+payload     视模型而定   这 1024 个 token 对应的 KV 单元
 ```
 
-Examples (K/V in f16, single stream):
+payload 占大头。每段约等于:
 
-| Model                     | layers x n_embd_kv | payload/segment |
-|---------------------------|--------------------|-----------------|
-| stories15M (6 x 288)      | 6 x 288 x 2 x 2 B  | ~6.8 KiB        |
-| 7B-class (32 x 1024)      | 32 x 1024 x 2 x 2 B| ~128 KiB        |
-| 70B-class GQA (80 x 1024) | 80 x 1024 x 2 x 2 B| ~320 KiB        |
+```
+n_layer x n_embd_kv x 2 (K 与 V) x sizeof(type_k/v) x n_streams
+```
 
-Session files are 44 bytes each.
+示例(K/V 为 f16,单流):
 
-**Growth and cleanup.** Segments are content-addressed and shared: forks and
-rewrites (e.g. a context rollback followed by new generation) create *new*
-segments and leave the old ones in place, so the directory grows monotonically.
-There is **no automatic garbage collection** - orphaned segments (chains no
-session points to) must be removed manually. A safe rule: stop the server,
-then delete `seg_*.bin` files you no longer want to restore; every session
-degrades gracefully (restore falls back to a shorter prefix, or a full
-prefill) if its segments are missing.
+| 模型                      | layers x n_embd_kv | 每段 payload   |
+|---------------------------|--------------------|----------------|
+| stories15M (6 x 288)      | 6 x 288 x 2 x 2 B  | ~6.8 KiB       |
+| 7B 级 (32 x 1024)         | 32 x 1024 x 2 x 2 B| ~128 KiB       |
+| 70B 级 GQA (80 x 1024)    | 80 x 1024 x 2 x 2 B| ~320 KiB       |
 
-### 1.6 Semantics, limits and error behavior
+session 文件每个固定 44 字节。
 
-| Situation | Behavior |
+**增长与清理。** 段是内容寻址且共享的:分叉与改写(例如上下文回滚后继续生成)会创建*新*段并保留旧段,因此目录单调增长。**没有自动垃圾回收** - 孤儿段(没有任何 session 指向的链)需要手动删除。安全做法:先停服务,再删掉不再需要恢复的 `seg_*.bin`;即使删错了段,一切也只是优雅降级(恢复回退到更短前缀,或完整 prefill)。
+
+### 1.6 语义、限制与错误行为
+
+| 场景 | 行为 |
 |---|---|
-| Save, everything already on disk | Zero IO, chain unchanged |
-| Save, < 1024 new tokens since last save | Nothing written (partial segments are never persisted) |
-| Save, prompt diverges from a saved chain | New fork segments written from the divergence point; old segments stay restorable |
-| Save, KV cache partially evicted | Chain on disk is preserved; only segments the cache still covers contiguously can be written; no error |
-| Save, head segment missing in cache AND on disk | Error (`-1` / HTTP 500) |
-| Restore, matched prefix < min_prefix | No-op, 0 tokens restored |
-| Restore, segment missing or corrupt mid-chain | Restore stops there; the verified prefix stays restored |
-| Restore across models / KV configs | Natural no-op (identity includes arch + KV types) |
+| 保存,内容全部已在磁盘 | 零 IO,链不变 |
+| 保存,距上次保存不足 1024 个新 token | 不写任何内容(不完整的段永不落盘) |
+| 保存,prompt 与已存链分叉 | 从分叉点写新分叉段;旧段仍可恢复 |
+| 保存,KV cache 部分被驱逐 | 磁盘上的链保持不变;只有 cache 仍连续覆盖的段可写;不报错 |
+| 保存,头段在 cache 和磁盘中都不存在 | 报错(`-1` / HTTP 500) |
+| 恢复,匹配前缀 < min_prefix | 无操作,恢复 0 token |
+| 恢复,链中途缺段或损坏 | 就此停止;已验证前缀保持已恢复状态 |
+| 跨模型 / 跨 KV 配置恢复 | 自然不匹配(身份包含 arch 与 KV 类型) |
 
-Explicit rejections:
+显式拒绝的场景:
 
-- **SWA (sliding window) caches** - save and load both reject with an error;
-  evicted SWA cells make per-segment completeness impossible.
-- **`n_pos_per_embd != 1`** (e.g. M-RoPE) - rejected; the hash chain is
-  defined over text token positions.
-- **Multimodal (mtmd) sequences** - the server rejects `save_incr` on slots
-  containing media (the chain covers text token ids only). `restore_incr`
-  always tokenizes plain text, so it simply does not match media sequences.
-- **Shifted positions** (context shift) - save is rejected only when the head
-  segment would have to be written; already-persisted chains are unaffected.
+- **SWA(滑窗注意力)cache** - 保存与恢复都直接报错拒绝;SWA 的单元驱逐使"每段完整"无法保证。
+- **`n_pos_per_embd != 1`**(如 M-RoPE)- 拒绝;哈希链定义在文本 token 位置上。
+- **多模态(mtmd)序列** - 服务端对含媒体的槽位拒绝 `save_incr`(哈希链只覆盖文本 token id)。`restore_incr` 总是按纯文本分词,天然不会匹配含媒体的序列。
+- **位置偏移**(context shift)- 仅当需要写头段时拒绝保存;已持久化的链不受影响。
 
-Concurrency: one writer per save directory. Inside the server the task queue
-serializes calls; the C API itself does not guard against two processes
-saving to the same directory.
+并发:每个保存目录单写者。服务端内部由任务队列串行;C API 本身不防两个进程写同一目录。
 
 ---
 
-## Part 2: Technical Principles
+## 第二部分:技术原理
 
-### 2.1 Content-addressed segment chain
+### 2.1 内容寻址的段链
 
-A conversation is a linked list of 1024-token segments. Each segment's name
-is derived from a truncated SHA-256 hash over its identity:
+一段对话是 1024-token 段组成的链表。每段的名字由其身份的截断 SHA-256 哈希导出:
 
 ```
-hash_0 = sha256(model_id || kv_params || 16 zero bytes || tokens_0)   # chain head
+hash_0 = sha256(model_id || kv_params || 16 zero bytes || tokens_0)   # 链头
 hash_k = sha256(model_id || kv_params || hash_{k-1}     || tokens_k)
 
 model_id  = llm_arch_name(model.arch)
-kv_params = "<type_k>|<type_v>|<n_pos_per_embd>"      # e.g. "f16|f16|1"
+kv_params = "<type_k>|<type_v>|<n_pos_per_embd>"      # 例如 "f16|f16|1"
 ```
 
-Key properties:
+关键性质:
 
-- **Immutable.** The KV payload is *not* part of the hash. A segment file is
-  written once and never modified, which makes file existence a reliable
-  fork-detection signal.
-- **Self-authenticating.** Given a token list, anyone can recompute the whole
-  hash chain with zero disk reads. Restore needs no index, no manifest, and
-  no session file: it hashes the prompt and checks which `seg_<hash>.bin`
-  files exist. This is what makes cross-session (G2) reuse free.
-- **Chain-linked.** Each hash binds to its predecessor, so a segment is only
-  valid at its position in one specific token chain - you cannot splice
-  segments from different conversations.
-- **Config-bound.** `model_id` and `kv_params` are inside the hash, so a
-  restore with a different model or cache type mismatches silently and
-  degrades to a normal full prefill.
+- **不可变。** KV payload *不*参与哈希。段文件只写一次、永不修改,因此"文件是否存在"成为可靠的分叉探测信号。
+- **自认证。** 给定 token 列表,任何人都能零磁盘读取地重算整条哈希链。恢复不需要索引、不需要 manifest、也不需要 session 文件:对 prompt 求哈希,检查哪些 `seg_<hash>.bin` 存在即可。这正是跨 session(G2)复用得以免费实现的原因。
+- **链式绑定。** 每个哈希绑定其前驱,所以一段只在某条特定 token 链的特定位置上有效 - 无法把不同对话的段拼接起来。
+- **配置绑定。** `model_id` 与 `kv_params` 在哈希之内,所以换模型或换 cache 类型恢复时会静默失配,退化为正常的完整 prefill。
 
-### 2.2 Segment file format (little-endian)
+### 2.2 段文件格式(小端)
 
 ```
 u32  magic "GGSD"
 u32  version = 1
 u32  seg_index
-[32] prev_hash                 # hex ascii, all '0' for the head
+[32] prev_hash                 # 十六进制 ASCII,链头全 '0'
 u32  n_tokens = 1024
 u64  payload_size
-[16] payload_hash              # truncated sha256 of the payload
+[16] payload_hash              # payload 的截断 sha256
 str  model_id
 str  kv_params
 i32  tokens[1024]
      payload
 ```
 
-The payload is the standard `llama_kv_cache::state_write` cell serialization
-(same format as GGSQ v2), restricted to the segment's position range. The
-payload hash is computed while streaming and patched into the header; restore
-verifies it and stops at the first mismatch (corruption guard, R: corrupted
-data can only shorten a restore, never poison it).
+payload 是标准的 `llama_kv_cache::state_write` 单元序列化(与 GGSQ v2 同格式),限定在该段的位置区间内。payload 哈希在流式写出时计算并回填进头部;恢复时校验,首个失配即停止(损坏防护:坏数据只能缩短恢复,绝不能污染已恢复的前缀)。
 
-The session file is a 44-byte hint (magic, version, tail hash, chain length)
-used only by save, to skip redundant rewrites and to know the previous chain
-length. Restore never reads it.
+session 文件是 44 字节的提示(magic、version、链尾哈希、链长),仅供保存侧使用,用于跳过多余重写并记住上次链长。恢复永远不读它。
 
-### 2.3 Save flow
+### 2.3 保存流程
 
-1. Guard: standard KV cache only, non-SWA, `n_pos_per_embd == 1`.
-2. Read the session file (optional; corrupt/missing simply starts fresh).
-3. Compute the hash chain for `tokens[0 .. n/1024)`.
-4. **Fork detection is file-existence based** (R2): walk the chain and find
-   the first hash whose `seg_<hash>.bin` is missing. The KV cache is
-   deliberately not consulted here - persisted segments remain valid even
-   after their cells are evicted.
-5. From that fork point, write segments while `count_cells_range` shows the
-   cache still covers the range contiguously; stop at the first gap
-   (partial-KV best effort, never shortens the chain). Existing files are
-   skipped (content addressing makes a rewrite redundant; see 2.5).
-6. The chain length is re-derived from disk (longest existing prefix). If it
-   is 0 - head neither on disk nor writable - the save fails (R3, the single
-   head-missing rule). A position guard (`seq_pos_min == 0`) applies only
-   when the head must be written (M2).
-7. Rewrite the 44-byte session file when length or tail hash changed.
+1. 守卫:仅标准 KV cache、非 SWA、`n_pos_per_embd == 1`。
+2. 读 session 文件(可选;损坏或缺失就当新链开始)。
+3. 对 `tokens[0 .. n/1024)` 计算哈希链。
+4. **分叉探测只看文件是否存在**(R2):沿链找到第一个 `seg_<hash>.bin` 缺失的哈希。这里有意不查 KV cache - 已持久化的段即使其单元被驱逐也依然有效。
+5. 从分叉点开始写段,只要 `count_cells_range` 显示 cache 仍连续覆盖该区间;遇到第一个空洞即停(部分 KV 尽力而为,绝不缩短链)。已存在的文件直接跳过(内容寻址使重写变得多余,见 2.5)。
+6. 链长从磁盘重新导出(最长的存在前缀)。若为 0 - 头段既不在磁盘也写不出 - 保存失败(R3,唯一的头段缺失规则)。位置守卫(`seq_pos_min == 0`)仅在必须写头段时生效(M2)。
+7. 链长或链尾哈希变化时重写 44 字节的 session 文件。
 
-Consequence (G1): a save with no new 1024-token boundary touches nothing on
-disk - measured at ~0.07 ms vs ~67 ms for a real segment write.
+推论(G1):没有跨出新的 1024-token 边界时,保存完全不触碰磁盘 - 实测 ~0.07 ms,对比真实写段 ~67 ms。
 
-### 2.4 Restore flow
+### 2.4 恢复流程
 
-1. Guard: non-SWA, `n_pos_per_embd == 1`.
-2. Compute the prompt's hash chain (pure arithmetic, no disk reads).
-3. For each hash, open `seg_<hash>.bin` from the directory of `session_path`
-   (segment-pool semantics, R1). Stop at the first missing file.
-4. For each matched segment: verify header (magic, version, model_id,
-   kv_params, prev_hash matches the chain), verify the payload hash while
-   reading, and replay the payload into the KV cache via
-   `llama_kv_cache::state_read_append` (appends without clearing the
-   sequence, so multiple segments restore back-to-back).
-5. Floor-align to 1024, apply `min_prefix`; below it, report 0 and leave the
-   cache untouched. On mid-chain corruption, the already-verified prefix
-   stays restored and the true length is returned (M1: return value always
-   matches the cache state).
-6. The server sets the slot's prompt to the restored prefix; normal prompt
-   processing continues from `n_past = n_tokens_restored`.
+1. 守卫:非 SWA、`n_pos_per_embd == 1`。
+2. 计算 prompt 的哈希链(纯算术,零磁盘读取)。
+3. 对每个哈希,从 `session_path` 所在目录打开 `seg_<hash>.bin`(段池语义,R1)。第一个文件缺失即停止。
+4. 对每个匹配段:校验头部(magic、version、model_id、kv_params、prev_hash 与链一致),边读边校验 payload 哈希,并通过 `llama_kv_cache::state_read_append` 把 payload 重放进 KV cache(不清空序列、直接追加,使多段可以连续恢复)。
+5. 向下对齐到 1024,再套用 `min_prefix`;低于阈值则返回 0 且 cache 保持原样。链中途损坏时,已验证前缀保持已恢复状态,返回值如实反映该长度(M1:返回值始终与 cache 状态一致)。
+6. 服务端把槽位 prompt 置为已恢复前缀;正常 prompt 处理从 `n_past = n_tokens_restored` 继续。
 
-### 2.5 Accepted nondeterminism
+### 2.5 已接受的浮点非确定性
 
-Segment identity does not include the KV payload. The same token chain
-prefilled twice can produce bitwise-different KV data (batch composition,
-thread count, backend). When a save finds an existing segment file it skips
-writing, so a later restore may replay KV computed under a different
-configuration. This is the same equivalence assumption the cross-slot prompt
-cache already makes, and is accepted explicitly. If bit-exact determinism
-were ever required, the payload hash would have to enter the content
-address.
+段的身份不包含 KV payload。同一 token 链两次 prefill 可能产生逐位不同的 KV 数据(batch 组成、线程数、后端都可能有影响)。保存发现段文件已存在时会跳过写盘,于是之后的恢复可能重放的是在不同配置下算出的 KV。这与现有跨槽位 prompt cache 的等价性假设相同,在此显式接受。若将来需要逐位确定性,就必须把 payload 哈希纳入内容地址。
 
-### 2.6 Implementation footprint
+### 2.6 实现足迹
 
-- `src/llama-sha256.{h,c}`: vendored public-domain SHA-256 (ggml has no
-  public one).
-- `src/llama-state-incr.cpp`: the two entry points, hashing, file IO
-  (reuses `llama_file`, `llama_io_write_i`/`llama_io_read_i`).
-- `src/llama-kv-cache.cpp`: `state_write_range` (position-range cell
-  slicing), `state_read_append` (append-without-clear read),
-  `count_cells_range`. The existing `state_write`/`state_read` now delegate
-  to these; their external behavior is unchanged.
-- `tools/server`: two task types and two slot actions; no routing changes
-  (`POST /slots/{id}?action=save_incr|restore_incr`).
+- `src/llama-sha256.{h,c}`:内联的公有领域 SHA-256(ggml 没有公开实现)。
+- `src/llama-state-incr.cpp`:两个入口函数、哈希、文件 IO(复用 `llama_file`、`llama_io_write_i`/`llama_io_read_i`)。
+- `src/llama-kv-cache.cpp`:`state_write_range`(按位置区间切分单元)、`state_read_append`(不清空、追加式读取)、`count_cells_range`。现有 `state_write`/`state_read` 改为委托给它们,外部行为不变。
+- `tools/server`:两个任务类型与两个槽位 action;路由不变(`POST /slots/{id}?action=save_incr|restore_incr`)。
 
-The GGSQ v2 format and its code paths are untouched; both mechanisms can
-coexist in the same server (they share only the save directory).
+GGSQ v2 格式及其代码路径完全未动;两种机制可以在同一服务端共存(只共享保存目录)。
