@@ -100,6 +100,14 @@ static bool decode_tokens(llama_context * ctx, const llama_tokens & tokens, size
     return true;
 }
 
+// the GGSD tests decode 3000+ tokens, which needs a context larger than n_ctx_train
+static llama_context_params incr_context_params(const struct common_params & params) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx   = 8192;
+    params_ctx.n_batch = 512;
+    return params_ctx;
+}
+
 static size_t count_segment_files() {
     size_t n = 0;
     for (const auto & entry : std::filesystem::directory_iterator(k_incr_dir)) {
@@ -466,7 +474,7 @@ static bool test_incr_roundtrip(struct llama_model * model, const struct common_
     const std::string session = session_path("session_roundtrip.bin");
     const llama_tokens tokens = make_random_tokens(model, 2500, 1234);
 
-    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     if (!decode_tokens(ctx.get(), tokens, 0, tokens.size(), 0)) {
         return false;
     }
@@ -489,7 +497,7 @@ static bool test_incr_roundtrip(struct llama_model * model, const struct common_
     }
 
     // fresh context: restore the aligned prefix, decode the remainder
-    auto ctx2 = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
 
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
     if (n_restored != 2048) {
@@ -514,7 +522,7 @@ static bool test_incr_append(struct llama_model * model, const struct common_par
     const std::string session = session_path("session_append.bin");
     const llama_tokens tokens = make_random_tokens(model, 2600, 4321);
 
-    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     if (!decode_tokens(ctx.get(), tokens, 0, 1500, 0)) {
         return false;
     }
@@ -543,7 +551,7 @@ static bool test_incr_append(struct llama_model * model, const struct common_par
         return false;
     }
 
-    auto ctx2 = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
 
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
     if (n_restored != 2048) {
@@ -571,7 +579,7 @@ static bool test_incr_fork(struct llama_model * model, const struct common_param
     tokens_b.resize(1500);
     tokens_b.insert(tokens_b.end(), tokens_b_tail.begin(), tokens_b_tail.end());
 
-    auto ctx_a = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx_a = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     if (!decode_tokens(ctx_a.get(), tokens_a, 0, tokens_a.size(), 0)) {
         return false;
     }
@@ -581,7 +589,7 @@ static bool test_incr_fork(struct llama_model * model, const struct common_param
         return false;
     }
 
-    auto ctx_b = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx_b = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     if (!decode_tokens(ctx_b.get(), tokens_b, 0, tokens_b.size(), 0)) {
         return false;
     }
@@ -596,7 +604,7 @@ static bool test_incr_fork(struct llama_model * model, const struct common_param
     }
 
     // restore chain B (the session tail)
-    auto ctx_rb = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx_rb = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored_b = llama_state_seq_load_incr(ctx_rb.get(), session.c_str(), 0, tokens_b.data(), tokens_b.size(), 64);
     if (n_restored_b != 2048) {
         LOG_ERR("\n%s: error: chain B restore expected 2048 tokens, got %zu\n", __func__, n_restored_b);
@@ -604,7 +612,7 @@ static bool test_incr_fork(struct llama_model * model, const struct common_param
     }
 
     // restore chain A (orphaned but still on disk)
-    auto ctx_ra = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx_ra = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored_a = llama_state_seq_load_incr(ctx_ra.get(), session.c_str(), 0, tokens_a.data(), tokens_a.size(), 64);
     if (n_restored_a != 2048) {
         LOG_ERR("\n%s: error: chain A restore expected 2048 tokens, got %zu\n", __func__, n_restored_a);
@@ -631,7 +639,7 @@ static bool test_incr_partial(struct llama_model * model, const struct common_pa
     const std::string session = session_path("session_partial.bin");
     const llama_tokens tokens = make_random_tokens(model, 3000, 555);
 
-    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     if (!decode_tokens(ctx.get(), tokens, 0, tokens.size(), 0)) {
         return false;
     }
@@ -651,7 +659,7 @@ static bool test_incr_partial(struct llama_model * model, const struct common_pa
         return false;
     }
 
-    auto ctx2 = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
     if (n_restored != 2048) {
         LOG_ERR("\n%s: error: expected 2048 tokens restored, got %zu\n", __func__, n_restored);
@@ -665,10 +673,12 @@ static bool test_incr_partial(struct llama_model * model, const struct common_pa
         LOG_ERR("\n%s: error: expected chain to be preserved after head eviction, got %d\n", __func__, n_segments);
         return false;
     }
-
-    // R3 head-missing rule: head segment present in the KV cache only
-    // partially (pos base still 0), no file on disk, cannot be written
-    auto ctx3 = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    // R3 head-missing rule: empty the segment pool first, otherwise the head
+    // file written by the chain above would keep the save alive
+    incr_test_cleanup();
+    // head segment present in the KV cache only partially (pos base still 0),
+    // no file on disk, cannot be written
+    auto ctx3 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     if (!decode_tokens(ctx3.get(), tokens, 0, tokens.size(), 0)) {
         return false;
     }
@@ -695,7 +705,7 @@ static bool test_incr_corrupt(struct llama_model * model, const struct common_pa
     const std::string session = session_path("session_corrupt.bin");
     const llama_tokens tokens = make_random_tokens(model, 2500, 777);
 
-    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     if (!decode_tokens(ctx.get(), tokens, 0, tokens.size(), 0)) {
         return false;
     }
@@ -720,7 +730,7 @@ static bool test_incr_corrupt(struct llama_model * model, const struct common_pa
         f.write(&c, 1);
     }
 
-    auto ctx2 = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
     if (n_restored != 1024) {
         LOG_ERR("\n%s: error: expected 1024 tokens restored (stop at corrupt segment), got %zu\n", __func__, n_restored);
@@ -753,7 +763,7 @@ static bool test_incr_mismatch(struct llama_model * model, const struct common_p
     const std::string session = session_path("session_kv.bin");
     const llama_tokens tokens = make_random_tokens(model, 2048, 999);
 
-    auto params_ctx = common_context_params_to_llama(params);
+    auto params_ctx = incr_context_params(params);
     params_ctx.type_k = GGML_TYPE_F32;
 
     auto ctx_f32 = llama_context_ptr{llama_init_from_model(model, params_ctx)};
@@ -765,7 +775,7 @@ static bool test_incr_mismatch(struct llama_model * model, const struct common_p
     }
 
     // restore with the default F16 cache: kv_params is part of the hash, no match
-    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored = llama_state_seq_load_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64);
     if (n_restored != 0) {
         LOG_ERR("\n%s: error: expected 0 tokens restored (kv params mismatch), got %zu\n", __func__, n_restored);
