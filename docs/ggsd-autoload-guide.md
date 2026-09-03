@@ -1,4 +1,4 @@
-# GGSD Autoload:自动前缀填充 - 使用手册与技术原理
+# GGSD Prompt Cache SSD(自动填充与自动落盘)- 使用手册与技术原理
 
 GGSD Autoload 让服务端在分配槽位时**自动**完成此前需要手动调用 `restore_incr` 才能做的事:当槽位内存缓存都帮不上忙时,从磁盘段池中找回与新请求前缀匹配的 KV 状态,只对剩余部分做 prefill。
 
@@ -25,16 +25,16 @@ GGSD Autoload 让服务端在分配槽位时**自动**完成此前需要手动�
 
 ### 1.2 配置与参数
 
-新增一个开关,**默认关闭**:
+一个开关同时启用读与写两个方向,**默认关闭**:
 
 ```
---slot-incr-autoload
+--prompt-cache-ssd
 ```
 
 前置条件:`--slot-save-path` 必须已设置(段池目录),否则启动时打警告并将开关视为关闭。示例:
 
 ```
-llama-server -m model.gguf --slot-save-path saves --slot-incr-autoload
+llama-server -m model.gguf --slot-save-path saves --prompt-cache-ssd
 ```
 
 两个固定阈值(不可配置,内置常量):
@@ -50,7 +50,8 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 
 **没有新的 API、没有新的请求字段**。你照常发 `/completion`;区别只在服务端内部:
 
-- 命中时:服务端日志出现 `autoloaded <N> GGSD tokens (slot X, cache Y)`,响应里 `timings.prompt_n` 只覆盖恢复前缀之后的 token 数;
+- **自动落盘(autosave)**:completion 结束、槽位释放时,服务端自动把该槽位的完整序列(含生成部分)保存到共享 session `__autosave__`;不足 1024 token 或没有跨出新段边界时是近零成本 no-op;失败(磁盘满等)只打日志,不影响请求;
+- **自动恢复(autoload)**:命中时服务端日志出现 `autoloaded <N> GGSD tokens (slot X, cache Y)`,响应里 `timings.prompt_n` 只覆盖恢复前缀之后的 token 数;
 - 未命中时:与今天完全一样,槽位续用或全量 prefill。
 
 实测证据(135M 模型,约 2000 token 的 prompt,保存后重启服务端再发同一请求):
@@ -74,6 +75,7 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 | 恢复尝试前预估就不足 | 什么都不碰(槽位此前已被抢救进 RAM cache) |
 | 含多模态(mtmd)的请求 | 跳过 GGSD 分支(哈希链无法表达媒体占位) |
 | 跨模型/跨 KV 配置 | 哈希链自然失配,GGSD 计 0,不触发 |
+| completion 结束 | 自动落盘到共享 session `__autosave__`(无新段边界时近零成本 no-op);失败仅日志,不影响请求 |
 
 ### 1.5 什么值得开启
 
@@ -155,7 +157,12 @@ size_t llama_state_seq_load_incr(..., size_t min_prefix_tokens,
 
 - `src/llama-state-incr.cpp`:`ggsd_hash_chain` helper(收敛 save/load 的重复链计算)、load 的 `k0` 差量逻辑、`state_seq_load_incr_estimate`;顺带修复既有栈溢出(payload_hash 16 字节缓冲写入 32 字节摘要,磁盘格式不变)。
 - `src/llama-context.h`:`state_seq_load_incr` 加参、声明 estimate(const 成员)。
-- `tools/server/server-task.{h,cpp}`:`server_prompt_cache` peek/consume 拆分。
-- `tools/server/server-context.cpp`:`--slot-incr-autoload` 前置检查、`autoload_ggsd` 仲裁方法、`update_cache` 块改造。
+- `tools/server/server-context.cpp`:`--prompt-cache-ssd` 前置检查、`autoload_ggsd` 仲裁方法、`slot_autosave` 自动落盘、`update_cache` 块改造。
 - `common/common.h`、`common/arg.cpp`:开关定义与解析。
 - 测试:`tests/test-save-load-state.cpp` Test 11(差量 + 删头强验证 + 生成等价)。
+
+### 2.7 自动落盘(autosave)
+
+触发点在 completion 结束、槽位释放处(生成停止的两个路径)。直接调用 `llama_state_seq_save_incr`,session 文件固定为段池目录下的 `session___autosave__.bin`(注意:C API 的 `session_path` 参数是 session **文件**路径,段池是其父目录)。共享单链的意义:多个槽位交替保存不同链时,分叉探测只看文件存在性,提示文件过期无害;段按内容寻址,跨槽共享不受 session 名影响。
+
+安全边界:fire-and-forget - save 失败(磁盘满、context shift 后的 R4 位置偏移拒绝等)只打 `SRV_WRN`,绝不影响请求结果;非 completion 任务、mtmd 序列、不足一段的 prompt 直接跳过。

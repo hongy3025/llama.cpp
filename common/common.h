@@ -673,7 +673,7 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
-    bool slot_incr_autoload      = false; // restore GGSD prefixes automatically at slot selection
+    bool prompt_cache_ssd        = false; // enable GGSD autoload + autosave (requires --slot-save-path)
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

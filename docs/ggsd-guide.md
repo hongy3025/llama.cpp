@@ -27,7 +27,7 @@ llama-server -m model.gguf --slot-save-path saves
 
 新增可选开关:
 
-- `--slot-incr-autoload` - 默认关闭;需要 `--slot-save-path`。开启后,服务端在为请求挑选槽位时,会自动把磁盘 GGSD 段池中与请求 prompt 匹配的前缀恢复进该槽位(见 1.3 与 1.6),客户端无需显式调用 `restore_incr`。
+- `--prompt-cache-ssd` - 默认关闭;需要 `--slot-save-path`。开启后,服务端在为请求挑选槽位时,会自动把磁盘 GGSD 段池中与请求 prompt 匹配的前缀恢复进该槽位(见 1.3 与 1.6),客户端无需显式调用 `restore_incr`。
 
 自动恢复使用两个固定的编译期常量(不可通过命令行调整):
 
@@ -46,7 +46,7 @@ saves/
 
 在现有 slots 路由上新增两个 action,均为同步调用。
 
-若启用 `--slot-incr-autoload`(见 1.2),服务端会在槽位选择阶段自动恢复与请求 prompt 匹配的 GGSD 磁盘前缀,无需客户端调用。下面两个 action 的语义不受该开关影响,`restore_incr` 仍按原样工作。
+若启用 `--prompt-cache-ssd`(见 1.2),服务端会在槽位选择阶段自动恢复与请求 prompt 匹配的 GGSD 磁盘前缀,无需客户端调用。下面两个 action 的语义不受该开关影响,`restore_incr` 仍按原样工作。
 
 #### 保存
 

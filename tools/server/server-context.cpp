@@ -1290,9 +1290,9 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
-        if (params_base.slot_incr_autoload && params_base.slot_save_path.empty()) {
-            SRV_WRN("%s", "--slot-incr-autoload requires --slot-save-path, disabling\n");
-            params_base.slot_incr_autoload = false;
+        if (params_base.prompt_cache_ssd && params_base.slot_save_path.empty()) {
+            SRV_WRN("%s", "--prompt-cache-ssd requires --slot-save-path, disabling\n");
+            params_base.prompt_cache_ssd = false;
         }
 
         if (params_base.n_ctx_checkpoints > 0) {
@@ -1466,6 +1466,35 @@ private:
         return nullptr;
     }
 
+    // fire-and-forget GGSD autosave at completion end; failures only log
+    void slot_autosave(server_slot & slot) {
+        if (!params_base.prompt_cache_ssd || slot.task == nullptr ||
+                slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+            return;
+        }
+
+        if (slot.prompt.tokens.has_mtmd) {
+            return;
+        }
+
+        const auto & tokens = slot.prompt.tokens.get_tokens();
+        if (tokens.size() < GGSD_AUTOLOAD_MIN_PREFIX) {
+            return;
+        }
+
+        // the C API's session_path is the session FILE; its parent directory
+        // is the segment pool. The manual endpoint builds the same name.
+        const std::string session_file = params_base.slot_save_path + "session___autosave__.bin";
+
+        const int32_t n_segments = llama_state_seq_save_incr(ctx_tgt, session_file.c_str(),
+                slot.id, tokens.data(), tokens.size());
+        if (n_segments < 0) {
+            SLT_WRN(slot, "%s", "GGSD autosave failed - ignoring\n");
+        } else {
+            SLT_INF(slot, "GGSD autosave: session __autosave__ covers %d segment(s)\n", n_segments);
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1568,7 +1597,7 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (params_base.slot_incr_autoload && !task.tokens.has_mtmd && !task.tokens.get_tokens().empty()) {
+                if (params_base.prompt_cache_ssd && !task.tokens.has_mtmd && !task.tokens.get_tokens().empty()) {
                     if (autoload_ggsd(*ret, task)) {
                         prompt_cache->update();
                         SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
@@ -1594,6 +1623,9 @@ private:
     bool autoload_ggsd(server_slot & slot, const server_task & task) {
         const auto & task_tokens = task.tokens.get_tokens();
 
+        // the pool is the parent directory of the session file
+        const std::string session_file = params_base.slot_save_path + "session___autosave__.bin";
+
         const size_t n_slot = slot.prompt.tokens.get_common_prefix(task.tokens);
 
         auto r_cache = prompt_cache->peek(task.tokens, slot.prompt.tokens);
@@ -1601,9 +1633,8 @@ private:
             ? (size_t) r_cache.it->prompt.tokens.get_common_prefix(task.tokens) : 0;
 
         const size_t n_ggsd = ctx_tgt == nullptr ? 0 :
-            ctx_tgt->state_seq_load_incr_estimate(params_base.slot_save_path.c_str(), slot.id,
+            ctx_tgt->state_seq_load_incr_estimate(session_file.c_str(), slot.id,
                     task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX);
-
         const size_t n_best = std::max({n_slot, n_cache, n_ggsd});
         if (n_best < GGSD_AUTOLOAD_MIN_PREFIX) {
             return false;
@@ -1616,11 +1647,11 @@ private:
 
             size_t n_restored = 0;
             if (lcp_complete && m_aligned >= 1024) {
-                n_restored = llama_state_seq_load_incr(ctx_tgt, params_base.slot_save_path.c_str(),
+                n_restored = llama_state_seq_load_incr(ctx_tgt, session_file.c_str(),
                         slot.id, task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX, m_aligned);
             } else {
                 m_aligned = 0;
-                n_restored = llama_state_seq_load_incr(ctx_tgt, params_base.slot_save_path.c_str(),
+                n_restored = llama_state_seq_load_incr(ctx_tgt, session_file.c_str(),
                         slot.id, task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX, 0);
             }
 
@@ -3942,6 +3973,7 @@ private:
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
+                slot_autosave(slot);
                 send_final_response(slot);
                 slot.release();
 
@@ -4062,6 +4094,7 @@ private:
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
+                    slot_autosave(slot);
                     send_final_response(slot);
                     slot.release();
 

@@ -3586,11 +3586,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"--slot-incr-autoload"},
-        {"--no-slot-incr-autoload"},
-        "automatically restore matching GGSD prefixes at slot selection (requires --slot-save-path)",
+        {"--prompt-cache-ssd"},
+        {"--no-prompt-cache-ssd"},
+        "enable GGSD autoload and autosave of prompt prefixes on disk (requires --slot-save-path)",
         [](common_params & params, bool value) {
-            params.slot_incr_autoload = value;
+            params.prompt_cache_ssd = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
