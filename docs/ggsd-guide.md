@@ -3,6 +3,7 @@
 GGSD(增量式槽位存储)为 llama.cpp 增加了内容寻址的增量式 KV cache 保存/恢复能力。长对话可以反复保存而代价接近于零;只要 token 前缀匹配,恢复时可以复用*任意*先前 session 保存的 KV 状态。
 
 设计文档:`docs/superpowers/specs/2026-07-31-ggsd-incremental-slot-storage-design.md`
+hybrid split 模式设计文档:`docs/superpowers/specs/2026-09-03-ggsd-hybrid-split-mode-design.md`
 
 ---
 
@@ -38,7 +39,8 @@ GGSD 的所有产物都在这一个目录里:
 
 ```
 saves/
-  seg_<hash>.bin          # 每 1024 token 一个 KV 段
+  seg_<hash>.bin          # 每 1024 token 一个 KV 段(hybrid 模型下只覆盖注意力层,见 1.7)
+  rec_<hash>.bin          # 仅 hybrid 模型:每份保存的会话状态一个文件(见 1.7)
   session_<name>.bin      # 极小的保存侧提示文件(链尾哈希,44 字节)
 ```
 
@@ -64,6 +66,7 @@ POST /slots/{id_slot}?action=save_incr
 
 - `n_segments` / `n_tokens` 描述的是**本次保存之后磁盘上整条链的覆盖量**,不是本次调用写入的量。没有跨出新的完整段时,重复保存返回相同数字且 `t_ms` 接近零。
 - `filename` 经过服务端文件名校验,对应磁盘上的 `session_<filename>.bin`。
+- hybrid split 模式(1.7)下 `save_incr` 不读写 session 提示文件(链长直接由段文件重导出);`n_segments` / `n_tokens` 仍指对齐段链的覆盖量,真实可恢复覆盖量可以更长(见 1.7)。
 
 #### 恢复
 
@@ -80,7 +83,7 @@ POST /slots/{id_slot}?action=restore_incr
 ```
 
 - `prompt` 按纯文本分词。其哈希链与保存目录中的 `seg_<hash>.bin` 文件进行匹配;`filename` 仅用于定位目录 - session 文件本身永远不会被读取。
-- 恢复的 token 数向下对齐到 1024。槽位的 prompt 被置为已恢复前缀,下一次 `/completion` 从这里继续;只有前缀之后的 token 需要重新 prefill。
+- 恢复的 token 数向下对齐到 1024(segment 模式)。hybrid split 模式的覆盖量是 rec 文件的 `n_tokens`,不对齐,见 1.7。槽位的 prompt 被置为已恢复前缀,下一次 `/completion` 从这里继续;只有前缀之后的 token 需要重新 prefill。
 - `min_prefix`(可选,默认 64)是最小恢复长度。匹配不足时不恢复任何内容,返回 `n_tokens_restored: 0`,prompt 走完整 prefill。把 `min_prefix` 设得高于预期匹配长度,即可表达"值得恢复才恢复"。
 
 #### 典型工作流
@@ -122,7 +125,7 @@ size_t llama_state_seq_load_incr(
         size_t   min_prefix_tokens);
 ```
 
-两者的同步要求与现有 `llama_state_seq_*` API 相同(照常在同一线程上调用 `llama_synchronize()` / decode)。
+两者的同步要求与现有 `llama_state_seq_*` API 相同(照常在同一线程上调用 `llama_synchronize()` / decode)。hybrid split 模式下 `llama_state_seq_load_incr` 的返回值不对齐到 1024(= rec 文件的 `n_tokens`),`llama_state_seq_save_incr` 不写 session 文件;见 1.7。
 
 ### 1.5 磁盘占用
 
@@ -164,18 +167,43 @@ session 文件每个固定 44 字节。
 | 保存,头段在 cache 和磁盘中都不存在 | 报错(`-1` / HTTP 500) |
 | 恢复,匹配前缀 < min_prefix | 无操作,恢复 0 token |
 | 恢复,链中途缺段或损坏 | 就此停止;已验证前缀保持已恢复状态 |
-| 跨模型 / 跨 KV 配置恢复 | 自然不匹配(身份包含 arch 与 KV 类型) |
+| 跨模型 / 跨 KV 配置恢复 | 自然不匹配(身份包含 arch、KV 类型与 `n_layer`) |
+| hybrid:rec 文件损坏/缺失/哈希失配 | 预估阶段跳过该候选;已选定的恢复中途失败则整体放弃,不做部分兜底(见 1.7) |
 | 自动恢复开启,前缀匹配已保存的段 | 槽位选择阶段自动恢复,prefill 只处理剩余部分 |
 | 自动恢复开启,GGSD 胜出但中途缺段 | 已验证前缀保持已恢复状态,剩余部分正常 prefill |
 
 显式拒绝的场景:
 
-- **SWA(滑窗注意力)cache** - 保存与恢复都直接报错拒绝;SWA 的单元驱逐使"每段完整"无法保证。
-- **`n_pos_per_embd != 1`**(如 M-RoPE)- 拒绝;哈希链定义在文本 token 位置上。
+- **SWA(滑窗注意力)cache** - 保存与恢复都直接报错拒绝;SWA 的单元驱逐使"每段完整"无法保证。SWA 混合(hybrid-iswa)与纯 recurrent cache 同样拒绝,见 1.7。
 - **多模态(mtmd)序列** - 服务端对含媒体的槽位拒绝 `save_incr`(哈希链只覆盖文本 token id)。`restore_incr` 总是按纯文本分词,天然不会匹配含媒体的序列。
 - **位置偏移**(context shift)- 仅当需要写头段时拒绝保存;已持久化的链不受影响。
 
+注:`n_pos_per_embd != 1`(如 M-RoPE)不再是拒绝理由 - 追加式恢复现已同步还原 `cell_ext`,哈希链仍只覆盖文本 token。
+
 并发:每个保存目录单写者。服务端内部由任务队列串行;C API 本身不防两个进程写同一目录。
+
+### 1.7 混合模型(Qwen3.5 家族):split 模式
+
+GGSD 按 KV memory 的具体类型分派:
+
+| memory 类型 | 模式 |
+|---|---|
+| `llama_kv_cache` | segment 模式(本手册上文,行为不变) |
+| `llama_memory_hybrid` | split 模式(本节) |
+| 其余(`llama_kv_cache_iswa`、`llama_memory_recurrent`、hybrid-iswa) | 仍然显式拒绝 |
+
+混合模型的每层状态分两类:注意力层的 KV 可按 token 位置切片;recurrent(线性注意力)层是一个不可切片的运行态摘要。split 模式据此把状态拆成两种文件:
+
+- **`seg_<hash>.bin`(共享段)**:只覆盖注意力层的对齐 1024-token KV,格式与哈希链同上(2.1/2.2)。分叉对话在磁盘上共享公共前缀段,与标准模式一样。
+- **`rec_<chain_hash>.bin`(每份保存的会话状态一个)**:非对齐的注意力层尾部(0 至 1023 个 token)加整个 recurrent 状态快照,附完整 token 列表与头部校验。
+
+匹配规则:请求必须**精确延长**某条已保存的对话 - recurrent 状态钉死在快照时的确切 token 前缀上,无法从段里重建。恢复覆盖量 = rec 文件的 `n_tokens`(可以不是 1024 的倍数);段文件只提供注意力 KV 的字节,从不单独扩大覆盖。
+
+清理:写入新的 rec 文件时,删除 token 序列是其**严格前缀**的旧 rec 文件 - 旧状态能匹配的请求新状态都能匹配且覆盖更长,删除无损;每条链只保留最新状态。段池策略不变:无自动 GC,孤儿段手动删。
+
+磁盘代价:每份会话状态 = recurrent 状态(固定,几 MB)+ 注意力尾部(最多 1023 token);公共前缀只存一份。SWA 混合(hybrid-iswa)仍被拒绝,`--swa-full` 与本节无关。
+
+并发与模式选择语义与 1.6 相同;`--prompt-cache-ssd` 的自动闭环见 `docs/ggsd-autoload-guide.md` 2.8。
 
 ---
 
@@ -190,7 +218,7 @@ hash_0 = sha256(model_id || kv_params || 16 zero bytes || tokens_0)   # 链头
 hash_k = sha256(model_id || kv_params || hash_{k-1}     || tokens_k)
 
 model_id  = llm_arch_name(model.arch)
-kv_params = "<type_k>|<type_v>|<n_pos_per_embd>"      # 例如 "f16|f16|1"
+kv_params = "<type_k>|<type_v>|<n_pos_per_embd>|<n_layer>"   # 例如 "f16|f16|1|32"
 ```
 
 关键性质:
@@ -198,7 +226,7 @@ kv_params = "<type_k>|<type_v>|<n_pos_per_embd>"      # 例如 "f16|f16|1"
 - **不可变。** KV payload *不*参与哈希。段文件只写一次、永不修改,因此"文件是否存在"成为可靠的分叉探测信号。
 - **自认证。** 给定 token 列表,任何人都能零磁盘读取地重算整条哈希链。恢复不需要索引、不需要 manifest、也不需要 session 文件:对 prompt 求哈希,检查哪些 `seg_<hash>.bin` 存在即可。这正是跨 session(G2)复用得以免费实现的原因。
 - **链式绑定。** 每个哈希绑定其前驱,所以一段只在某条特定 token 链的特定位置上有效 - 无法把不同对话的段拼接起来。
-- **配置绑定。** `model_id` 与 `kv_params` 在哈希之内,所以换模型或换 cache 类型恢复时会静默失配,退化为正常的完整 prefill。
+- **配置绑定。** `model_id` 与 `kv_params` 在哈希之内,所以换模型或换 cache 类型恢复时会静默失配,退化为正常的完整 prefill。`kv_params` 现包含 `n_layer`(split 模式要求 attn 子缓存与整模型可区分);此前写下的旧段池哈希全部失配,等同换配置,可直接删除。
 
 ### 2.2 段文件格式(小端)
 
@@ -220,9 +248,11 @@ payload 是标准的 `llama_kv_cache::state_write` 单元序列化(与 GGSQ v2 �
 
 session 文件是 44 字节的提示(magic、version、链尾哈希、链长),仅供保存侧使用,用于跳过多余重写并记住上次链长。恢复永远不读它。
 
+hybrid split 模式额外使用 `rec_<chain_hash>.bin`(magic `"GGSR"`,version 同上):头部含 `n_tokens`、`n_tail`、32 字符 `chain_hash`、`payload_size`、`payload_hash`、`model_id`、`kv_params` 与完整 token 列表;payload 先写非对齐 attn 尾部(与段相同的区间格式),再写整个 recurrent 状态。`chain_hash` 覆盖 `tokens[0, n_tokens)` 全序列,不是段对齐前缀。
+
 ### 2.3 保存流程
 
-1. 守卫:仅标准 KV cache、非 SWA、`n_pos_per_embd == 1`。
+1. 分派:`llama_memory_hybrid` 走 split 保存(见 1.7);其余仅接受标准 KV cache,守卫:非 SWA。
 2. 读 session 文件(可选;损坏或缺失就当新链开始)。
 3. 对 `tokens[0 .. n/1024)` 计算哈希链。
 4. **分叉探测只看文件是否存在**(R2):沿链找到第一个 `seg_<hash>.bin` 缺失的哈希。这里有意不查 KV cache - 已持久化的段即使其单元被驱逐也依然有效。
@@ -234,7 +264,7 @@ session 文件是 44 字节的提示(magic、version、链尾哈希、链长),�
 
 ### 2.4 恢复流程
 
-1. 守卫:非 SWA、`n_pos_per_embd == 1`。
+1. 分派:`llama_memory_hybrid` 走 split 恢复(见 1.7);其余仅接受标准 KV cache,守卫:非 SWA。
 2. 计算 prompt 的哈希链(纯算术,零磁盘读取)。
 3. 对每个哈希,从 `session_path` 所在目录打开 `seg_<hash>.bin`(段池语义,R1)。第一个文件缺失即停止。
 4. 对每个匹配段:校验头部(magic、version、model_id、kv_params、prev_hash 与链一致),边读边校验 payload 哈希,并通过 `llama_kv_cache::state_read_append` 把 payload 重放进 KV cache(不清空序列、直接追加,使多段可以连续恢复)。
@@ -251,5 +281,6 @@ session 文件是 44 字节的提示(magic、version、链尾哈希、链长),�
 - `src/llama-state-incr.cpp`:两个入口函数、哈希、文件 IO(复用 `llama_file`、`llama_io_write_i`/`llama_io_read_i`)。
 - `src/llama-kv-cache.cpp`:`state_write_range`(按位置区间切分单元)、`state_read_append`(不清空、追加式读取)、`count_cells_range`。现有 `state_write`/`state_read` 改为委托给它们,外部行为不变。
 - `tools/server`:两个任务类型与两个槽位 action;路由不变(`POST /slots/{id}?action=save_incr|restore_incr`)。
+- hybrid split(见 1.7):同文件 `src/llama-state-incr.cpp` 内按 memory 类分派的 save/load/estimate 三支,rec 文件的读写 helper;前置修复在 `src/llama-kv-cache.cpp` 的 `state_read_meta` 追加分支补上 `cells.ext_set`,使 M-RoPE 位置可恢复。
 
 GGSQ v2 格式及其代码路径完全未动;两种机制可以在同一服务端共存(只共享保存目录)。

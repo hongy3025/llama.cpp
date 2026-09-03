@@ -3,7 +3,7 @@
 GGSD Prompt Cache SSD 让服务端形成 KV 复用的自动闭环:completion 结束时自动把槽位状态落盘到磁盘段池(autosave);分配槽位时,当槽位内存缓存都帮不上忙,自动从段池找回与新请求前缀匹配的 KV(autoload),只对剩余部分做 prefill。
 
 设计文档:`docs/superpowers/specs/2026-09-03-ggsd-autoload-design.md`
-基础 GGSD 手册:`docs/ggsd-guide.md`(段格式、哈希链、保存/恢复语义)
+基础 GGSD 手册:`docs/ggsd-guide.md`(段格式、哈希链、保存/恢复语义);hybrid split 模式设计:`docs/superpowers/specs/2026-09-03-ggsd-hybrid-split-mode-design.md`
 
 ---
 
@@ -117,7 +117,7 @@ slot 胜出              -> 什么都不做
 size_t state_seq_load_incr_estimate(session_path, seq_id, tokens, n, min_prefix) const;
 ```
 
-实现 = 对 `tokens` 逐段计算哈希链(纯 SHA-256,无磁盘读取)+ 沿链对每个 `seg_<hash>.bin` 做一次 `stat` 判存在。万级 prompt 只是十几次 stat,微秒级。段池的"文件存在即有效"性质(基础手册 2.1:段不可变、自认证)使**不读内容就能精确知道能恢复多少**。SWA / M-RoPE 直接返回 0,与 load 的拒绝语义对齐。
+实现 = 对 `tokens` 逐段计算哈希链(纯 SHA-256,无磁盘读取)+ 沿链对每个 `seg_<hash>.bin` 做一次 `stat` 判存在。万级 prompt 只是十几次 stat,微秒级。段池的"文件存在即有效"性质(基础手册 2.1:段不可变、自认证)使**不读内容就能精确知道能恢复多少**。SWA 直接返回 0;标准 cache 下 M-RoPE 也已放开(`cell_ext` 随追加式恢复还原)。hybrid 模型走独立的 rec 头部扫描(见 2.8)。
 
 因此自动路径的 miss 成本可以忽略,不需要命中率学习或缓存决策结果。
 
@@ -138,6 +138,8 @@ size_t llama_state_seq_load_incr(..., size_t min_prefix_tokens,
   - 返回值 = `(已重放段数 + k0) * 1024`,始终与槽位实际覆盖一致(M1 语义)。
 
 服务端侧的差量触发条件:`n_slot >= 1024` 且槽位 token 恰好是请求 token 的前缀(LCP 完整,否则跳过的段与槽位 KV 不对应)。对齐公式 `m_aligned = floor(min(n_slot, n_ggsd)/1024)*1024` 保证不重叠。
+
+hybrid split 模式不走差量回放:rec 状态钉死覆盖量,`n_prefix_valid` 被忽略,始终全量重放(见 2.8)。
 
 强验证(已入测试 Test 11):decode 2500 → save 2 段 → **删掉段 0 文件** → 用 `n_prefix_valid=1024` 恢复,仍得 2048 且生成与参考一致 - 证明跳过的段从未被读;同一删除下 `n_prefix_valid=0` 则恢复 0。
 
@@ -166,3 +168,15 @@ size_t llama_state_seq_load_incr(..., size_t min_prefix_tokens,
 触发点在 completion 结束、槽位释放处(生成停止的两个路径)。直接调用 `llama_state_seq_save_incr`,session 文件固定为段池目录下的 `session___autosave__.bin`(注意:C API 的 `session_path` 参数是 session **文件**路径,段池是其父目录)。共享单链的意义:多个槽位交替保存不同链时,分叉探测只看文件存在性,提示文件过期无害;段按内容寻址,跨槽共享不受 session 名影响。
 
 安全边界:fire-and-forget - save 失败(磁盘满、context shift 后的 R4 位置偏移拒绝等)只打 `SRV_WRN`,绝不影响请求结果;非 completion 任务、mtmd 序列、不足一段的 prompt 直接跳过。
+
+### 2.8 hybrid 模型(Qwen3.5 家族):split 模式下的自动闭环
+
+`--prompt-cache-ssd` 现在同时覆盖两类 memory:`llama_kv_cache` 走上述段模式(行为不变);`llama_memory_hybrid` 走 split 模式(基础手册 1.7:共享 attn 段 + 每份保存状态一个 `rec_<chain_hash>.bin`);其余 cache 类(`llama_kv_cache_iswa`、纯 recurrent、hybrid-iswa)照旧拒绝。SWA 混合被拒绝,`--swa-full` 与此无关。
+
+对自动路径的影响:
+
+- **仲裁接口不变**。hybrid 的预估改为扫描 `rec_*.bin` 头部(只读头部,不读 token 数组,每头几 KB):命中条件 = 请求 token 前缀的链哈希等于文件的 `chain_hash`,并且用与 load 完全相同的分块(tiling)规则校验对齐段链的存在性 - 段不齐的文件直接跳过,预估命中不可能建立在缺失段之上。报价 = 该文件的 `n_tokens`。`min_prefix` / margin 规则不变。
+- **匹配更严**:请求必须精确延长某条已保存的对话(rec 状态无法从中间截断,段文件不单独扩大覆盖)。连续对话(下一轮 prompt = 上一轮全文 + 新内容)天然满足;分叉对话共享磁盘上的对齐 attn 段,但各自需要新的 rec 文件。
+- **成本**:hybrid 命中路径没有差量回放(见 2.3),整段重放;每份会话状态的磁盘占用 = rec 状态(固定,几 MB)+ 非对齐 attn 尾部(最多 1023 token)。
+- **落盘即清理**:autosave 写完新 rec 文件后删除被其支配(token 序列是其严格前缀)的旧 rec 文件,每条链只留最新状态;段池仍无自动 GC,手动删。
+- autosave 失败兜底、`--cache-ram` 共存、mtmd 跳过等语义与标准模型完全一致。

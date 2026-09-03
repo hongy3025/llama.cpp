@@ -4,6 +4,16 @@ Date: 2026-07-31 (amended 2026-09-02, see docs/plans/2026-09-02-ggsd-remediation
 
 Status: Approved, amended after design review
 
+Amendment (2026-09-03): the "standard kv cache only" scope below is superseded
+by `docs/superpowers/specs/2026-09-03-ggsd-hybrid-split-mode-design.md`:
+`llama_memory_hybrid` models (Qwen3.5 family) are now supported via split mode
+(shared attention segments + one `rec_<chain_hash>.bin` per saved conversation
+state); all other cache classes stay rejected. The `n_pos_per_embd != 1`
+rejection is lifted (append-path restore now rebuilds `cell_ext`), and the
+`kv_params` identity additionally includes `n_layer`, which invalidates
+segment pools written before the change. The rest of this document is kept as
+a historical record.
+
 ## Problem Statement
 
 The current slot save/restore mechanism (`/slots/{id}/save`, `/slots/{id}/restore`)
