@@ -1,6 +1,6 @@
 # GGSD Prompt Cache SSD(自动填充与自动落盘)- 使用手册与技术原理
 
-GGSD Autoload 让服务端在分配槽位时**自动**完成此前需要手动调用 `restore_incr` 才能做的事:当槽位内存缓存都帮不上忙时,从磁盘段池中找回与新请求前缀匹配的 KV 状态,只对剩余部分做 prefill。
+GGSD Prompt Cache SSD 让服务端形成 KV 复用的自动闭环:completion 结束时自动把槽位状态落盘到磁盘段池(autosave);分配槽位时,当槽位内存缓存都帮不上忙,自动从段池找回与新请求前缀匹配的 KV(autoload),只对剩余部分做 prefill。
 
 设计文档:`docs/superpowers/specs/2026-09-03-ggsd-autoload-design.md`
 基础 GGSD 手册:`docs/ggsd-guide.md`(段格式、哈希链、保存/恢复语义)
@@ -11,9 +11,9 @@ GGSD Autoload 让服务端在分配槽位时**自动**完成此前需要手动�
 
 ### 1.1 解决什么问题
 
-开启 GGSD Autoload 之前,磁盘段池只是一个"手动检查点":进程重启后,即使段池里躺着与新请求完全匹配的前缀,服务端也会从零 prefill,除非调用方显式调 `restore_incr`。
+开启本特性之前,磁盘段池只是一个"手动检查点":要靠调用方显式调 `save_incr` 写入、`restore_incr` 读回,进程重启后即使池里有匹配前缀也会从零 prefill。
 
-开启之后,服务端把磁盘段池当作第三级 KV 复用来源,与另外两级自动竞争:
+开启之后,服务端把磁盘段池当作第三级 KV 复用来源,自动写入、自动读回,与另外两级竞争:
 
 ```
 第 1 级  槽位 KV(内存,请求间留存)      - 现有 LCP 相似度逻辑
@@ -54,7 +54,7 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 - **自动恢复(autoload)**:命中时服务端日志出现 `autoloaded <N> GGSD tokens (slot X, cache Y)`,响应里 `timings.prompt_n` 只覆盖恢复前缀之后的 token 数;
 - 未命中时:与今天完全一样,槽位续用或全量 prefill。
 
-实测证据(135M 模型,约 2000 token 的 prompt,保存后重启服务端再发同一请求):
+实测证据(135M 模型,约 2000 token 的 prompt:第一次 completion 触发自动落盘,重启服务端后重发同一请求):
 
 ```
 关闭开关:  prompt_n = 2001   (全量 prefill)
@@ -81,7 +81,7 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 
 - 长对话检查点 + 服务经常重启:磁盘池跨进程持久,重启后第一发请求就能省下整段 prefill;
 - 多客户端共享长前缀(固定 system prompt、RAG 文档):段池按内容寻址,谁保存的都能复用;
-- RAM 紧张(`--cache-ram` 调小)但磁盘宽裕:把二级缓存的重心移到磁盘。
+- 开环变闭环:无需任何手动 `save_incr`,对话在多次请求/多次重启间自动接力。
 
 不建议开启的场景:请求前缀高度随机(命中率低,虽然 miss 路径只有哈希计算 + 每段一次 stat,成本可忽略,但也没有收益);磁盘 IO 受严格 SLO 约束的环境(命中路径有真实读盘,尽管 OS page cache 会吸收重复读)。
 
@@ -149,7 +149,7 @@ size_t llama_state_seq_load_incr(..., size_t min_prefix_tokens,
 
 ### 2.5 与基础 GGSD 语义的关系
 
-- 段格式、哈希链、保存流程完全不变;本特性只消费段池,不写入。
+- 段格式、哈希链、save/load 的核心流程不变;本特性新增了段池的自动消费(autoload)与自动写入(autosave),写入仍走原有 `save_incr` 路径。
 - FP 非确定性假设不变:槽位前缀 KV 与请求 token 的对应关系靠 `prompt.tokens` 记录信任(payload 不在哈希内),与 prompt cache 同一信任面。手动端点面对空槽没有这个问题,自动路径显式承担了它。
 - 单写者假设不变;预估与实际加载之间段池若被并发修改,由 load 的逐段校验兜底,返回值如实。
 
