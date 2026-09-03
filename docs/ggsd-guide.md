@@ -29,10 +29,10 @@ llama-server -m model.gguf --slot-save-path saves
 
 - `--prompt-cache-ssd` - 默认关闭;需要 `--slot-save-path`。开启后形成闭环:completion 结束时自动把槽位序列落盘到共享 session `__autosave__`(autosave);为请求挑选槽位时,自动把段池中匹配的 prompt 前缀恢复进槽位(autoload),客户端无需显式调用 `save_incr` / `restore_incr`(详见 `docs/ggsd-autoload-guide.md`)。
 
-自动恢复使用两个固定的编译期常量(不可通过命令行调整):
+自动恢复与自动落盘使用两个命令行可调参数:
 
-- `GGSD_AUTOLOAD_MIN_PREFIX = 1024` - 自动恢复的最小前缀 token 数(至少一个完整段);
-- `GGSD_AUTOLOAD_MARGIN = 256` - GGSD 候选必须领先次优来源(槽内 KV cache / RAM prompt cache)至少这么多 token 才会胜出。
+- `--prompt-cache-ssd-min-prefix N`(默认 1024)- 触发自动恢复/落盘的最小可复用前缀 token 数(建议为段大小 1024 的倍数);
+- `--prompt-cache-ssd-margin N`(默认 256)- GGSD 候选必须领先次优来源(槽内 KV cache / RAM prompt cache)至少这么多 token 才会胜出。
 
 GGSD 的所有产物都在这一个目录里:
 

@@ -3594,6 +3594,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prompt-cache-ssd-min-prefix"}, "N",
+        string_format("min reusable prefix tokens to trigger GGSD autoload/autosave (default: %d)", params.prompt_cache_ssd_min_prefix),
+        [](common_params & params, int value) {
+            params.prompt_cache_ssd_min_prefix = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prompt-cache-ssd-margin"}, "N",
+        string_format("GGSD candidate must beat the runner-up by this many tokens (default: %d)", params.prompt_cache_ssd_margin),
+        [](common_params & params, int value) {
+            params.prompt_cache_ssd_margin = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

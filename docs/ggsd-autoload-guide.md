@@ -37,12 +37,12 @@ GGSD Prompt Cache SSD 让服务端形成 KV 复用的自动闭环:completion 结
 llama-server -m model.gguf --slot-save-path saves --prompt-cache-ssd
 ```
 
-两个固定阈值(不可配置,内置常量):
+两个阈值参数(默认 1024/256,可用命令行调整):
 
-| 常量 | 值 | 含义 |
+| 参数 | 默认 | 含义 |
 |---|---|---|
-| `GGSD_AUTOLOAD_MIN_PREFIX` | 1024 | 至少能复用一个完整段才触发磁盘恢复 |
-| `GGSD_AUTOLOAD_MARGIN` | 256 | GGSD 必须比次优来源多出至少 256 token 才胜出 |
+| `--prompt-cache-ssd-min-prefix N` | 1024 | 至少能复用这么多 token 才触发磁盘恢复/落盘(建议为段大小 1024 的倍数) |
+| `--prompt-cache-ssd-margin N` | 256 | GGSD 必须比次优来源多出至少这么多 token 才胜出 |
 
 Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比 RAM cache 多赚几个 token,不值得。关闭开关时,服务端行为与不装此特性**逐字节一致**。
 

@@ -36,9 +36,6 @@
 #include <windows.h>
 #endif
 
-static constexpr size_t GGSD_AUTOLOAD_MIN_PREFIX = 1024; // at least one full segment
-static constexpr size_t GGSD_AUTOLOAD_MARGIN     = 256;  // must beat the runner-up by this much
-
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -1478,7 +1475,7 @@ private:
         }
 
         const auto & tokens = slot.prompt.tokens.get_tokens();
-        if (tokens.size() < GGSD_AUTOLOAD_MIN_PREFIX) {
+        if (tokens.size() < (size_t) params_base.prompt_cache_ssd_min_prefix) {
             return;
         }
 
@@ -1634,13 +1631,13 @@ private:
 
         const size_t n_ggsd = ctx_tgt == nullptr ? 0 :
             ctx_tgt->state_seq_load_incr_estimate(session_file.c_str(), slot.id,
-                    task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX);
+                    task_tokens.data(), task_tokens.size(), (size_t) params_base.prompt_cache_ssd_min_prefix);
         const size_t n_best = std::max({n_slot, n_cache, n_ggsd});
-        if (n_best < GGSD_AUTOLOAD_MIN_PREFIX) {
+        if (n_best < (size_t) params_base.prompt_cache_ssd_min_prefix) {
             return false;
         }
 
-        if (n_ggsd >= n_best && n_ggsd - std::max(n_slot, n_cache) >= GGSD_AUTOLOAD_MARGIN) {
+        if (n_ggsd >= n_best && n_ggsd - std::max(n_slot, n_cache) >= (size_t) params_base.prompt_cache_ssd_margin) {
             size_t m_aligned = std::min(n_slot, n_ggsd) / 1024 * 1024;
             const bool lcp_complete = n_slot > 0 && n_slot == slot.prompt.tokens.size()
                 && slot.prompt.tokens.get_tokens().size() >= m_aligned;
@@ -1648,14 +1645,14 @@ private:
             size_t n_restored = 0;
             if (lcp_complete && m_aligned >= 1024) {
                 n_restored = llama_state_seq_load_incr(ctx_tgt, session_file.c_str(),
-                        slot.id, task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX, m_aligned);
+                        slot.id, task_tokens.data(), task_tokens.size(), (size_t) params_base.prompt_cache_ssd_min_prefix, m_aligned);
             } else {
                 m_aligned = 0;
                 n_restored = llama_state_seq_load_incr(ctx_tgt, session_file.c_str(),
-                        slot.id, task_tokens.data(), task_tokens.size(), GGSD_AUTOLOAD_MIN_PREFIX, 0);
+                        slot.id, task_tokens.data(), task_tokens.size(), (size_t) params_base.prompt_cache_ssd_min_prefix, 0);
             }
 
-            if (n_restored >= GGSD_AUTOLOAD_MIN_PREFIX) {
+            if (n_restored >= (size_t) params_base.prompt_cache_ssd_min_prefix) {
                 slot.prompt.tokens = server_tokens(
                         llama_tokens(task_tokens.begin(), task_tokens.begin() + n_restored),
                         /* has_mtmd = */ false);

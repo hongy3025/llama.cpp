@@ -82,11 +82,11 @@ mid-chain append is therefore both semantically impossible and redundant.
 Precondition: `--slot-save-path` must be set; otherwise the server logs a
 warning at startup and treats the flag as off.
 
-Constants (fixed, not configurable):
+Thresholds (CLI-configurable; amended 2026-09-03, originally fixed constants):
 
 ```
-GGSD_AUTOLOAD_MIN_PREFIX = 1024   # at least one full segment must be reusable
-GGSD_AUTOLOAD_MARGIN     = 256    # GGSD must beat the runner-up by this much
+--prompt-cache-ssd-min-prefix N   # default 1024, min reusable prefix tokens
+--prompt-cache-ssd-margin N       # default 256, must beat the runner-up by this much
 ```
 
 The margin prevents churn: a GGSD restore with ~65 ms IO per segment is not
