@@ -2286,6 +2286,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         }
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
+        std::vector<llama_kv_cell_ext> exts;
+        if (hparams.n_pos_per_embd() > 1) {
+            exts.reserve(cell_count);
+        }
+
         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
 
         ubatch.seq_id_unq[0] = dest_seq_id;
@@ -2308,6 +2313,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
                 ubatch.pos[i + ubatch.n_tokens]   = ext.y;
                 ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+                exts.push_back(ext);
             }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
@@ -2327,9 +2333,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
-        //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+
+        if (hparams.n_pos_per_embd() > 1) {
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                cells.ext_set(sinfo.idxs[0][i], exts[i]);
+            }
+        }
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 
