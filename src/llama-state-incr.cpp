@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-sha256.h"
@@ -123,6 +124,14 @@ namespace {
         return str;
     }
 
+    // identity string of the kv cache configuration, shared by all entry points
+    std::string ggsd_kv_params(const llama_model & model, const llama_kv_cache * kv) {
+        return std::string(ggml_type_name(kv->type_k())) + "|" +
+               std::string(ggml_type_name(kv->type_v())) + "|" +
+               std::to_string(model.hparams.n_pos_per_embd()) + "|" +
+               std::to_string(model.hparams.n_layer());
+    }
+
     // file IO that hashes the bytes as they are written
     class ggsd_io_write_file : public llama_io_write_i {
     public:
@@ -221,6 +230,238 @@ namespace {
         };
         std::vector<read_info> rinfos;
     };
+
+    constexpr char GGSD_REC_MAGIC[4] = { 'G', 'G', 'S', 'R' };
+
+    // rec header size before the payload hash field
+    constexpr size_t GGSD_REC_HEADER_PAYLOAD_HASH_OFFSET = 4 + 4 + 4 + 4 + 32 + 8;
+
+    struct ggsd_rec_header {
+        uint32_t n_tokens = 0;
+        uint32_t n_tail = 0;
+        std::string chain_hash;
+        std::string model_id;
+        std::string kv_params;
+        std::vector<llama_token> tokens;
+        uint64_t payload_size = 0;
+        uint8_t payload_hash[GGSD_HASH_BYTES] = {};
+    };
+
+    std::string ggsd_prefix_hash(
+            const std::string & model_id,
+            const std::string & kv_params,
+            const llama_token * tokens,
+            size_t n) {
+        llama_sha256_t sha;
+        llama_sha256_init(&sha);
+
+        const uint32_t len_model = (uint32_t) model_id.size();
+        llama_sha256_update(&sha, (const uint8_t *) &len_model, sizeof(len_model));
+        llama_sha256_update(&sha, (const uint8_t *) model_id.data(), len_model);
+
+        const uint32_t len_params = (uint32_t) kv_params.size();
+        llama_sha256_update(&sha, (const uint8_t *) &len_params, sizeof(len_params));
+        llama_sha256_update(&sha, (const uint8_t *) kv_params.data(), len_params);
+
+        llama_sha256_update(&sha, (const uint8_t *) tokens, n * sizeof(llama_token));
+
+        uint8_t digest[32];
+        llama_sha256_final(&sha, digest);
+
+        std::string hex(GGSD_HASH_HEX_LEN, '0');
+        for (size_t i = 0; i < GGSD_HASH_BYTES; ++i) {
+            const uint8_t hi = digest[i] >> 4;
+            const uint8_t lo = digest[i] & 0x0F;
+            hex[2*i + 0] = hi < 10 ? '0' + hi : 'a' + hi - 10;
+            hex[2*i + 1] = lo < 10 ? '0' + lo : 'a' + lo - 10;
+        }
+        return hex;
+    }
+
+    std::string ggsd_rec_path(const std::string & session_path, const std::string & hash) {
+        std::filesystem::path p(session_path);
+        return (p.parent_path() / ("rec_" + hash + ".bin")).string();
+    }
+
+    // true for rec_<hash>.bin cache files (exact suffix, not a substring hit)
+    bool ggsd_is_rec_name(const std::string & name) {
+        return name.rfind("rec_", 0) == 0 && name.size() >= 4 &&
+               name.compare(name.size() - 4, 4, ".bin") == 0;
+    }
+
+    // reads magic, version, n_tokens, n_tail, chain_hash, payload_size, payload_hash,
+    // model_id, kv_params; the token array is read only when read_tokens is set.
+    bool ggsd_rec_read_header(llama_file & file, ggsd_rec_header & out, bool read_tokens = true) {
+        try {
+            char magic[4];
+            file.read_raw(magic, sizeof(magic));
+            if (memcmp(magic, GGSD_REC_MAGIC, sizeof(magic)) != 0) {
+                return false;
+            }
+            if (file.read_u32() != GGSD_VERSION) {
+                return false;
+            }
+            out.n_tokens = file.read_u32();
+            out.n_tail   = file.read_u32();
+
+            char hash[GGSD_HASH_HEX_LEN];
+            file.read_raw(hash, sizeof(hash));
+            out.chain_hash.assign(hash, sizeof(hash));
+
+            file.read_raw(&out.payload_size, sizeof(out.payload_size));
+            file.read_raw(out.payload_hash, GGSD_HASH_BYTES);
+
+            out.model_id  = ggsd_read_str(file);
+            out.kv_params = ggsd_read_str(file);
+
+            // bound the header-derived allocation by the file size
+            if (read_tokens) {
+                if ((size_t) out.n_tokens * sizeof(llama_token) > file.size()) {
+                    return false;
+                }
+                out.tokens.resize(out.n_tokens);
+                if (out.n_tokens > 0) {
+                    file.read_raw(out.tokens.data(), out.n_tokens * sizeof(llama_token));
+                }
+            }
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    // write one aligned segment file (.tmp + rename), shared by the standard
+    // and hybrid save paths
+    void ggsd_write_segment(
+            llama_kv_cache * kv,
+            const std::string & session_path,
+            llama_seq_id seq_id,
+            size_t k,
+            const std::vector<std::string> & hashes,
+            const std::string & model_id,
+            const std::string & kv_params,
+            const llama_token * tokens,
+            llama_pos pos_begin,
+            llama_pos pos_end,
+            size_t & n_written) {
+        // measure the payload size
+        ggsd_io_write_dummy io_dummy;
+        kv->state_write_range(io_dummy, seq_id, pos_begin, pos_end);
+        const uint64_t payload_size = io_dummy.n_bytes();
+
+        const std::string fname = ggsd_segment_path(session_path, hashes[k]);
+        const std::string fname_tmp = fname + ".tmp";
+        {
+            llama_file file(fname_tmp.c_str(), "wb");
+
+            file.write_raw(GGSD_MAGIC, sizeof(GGSD_MAGIC));
+            file.write_u32(GGSD_VERSION);
+            file.write_u32((uint32_t) k);
+
+            char prev[GGSD_HASH_HEX_LEN];
+            if (k == 0) {
+                memset(prev, 0, sizeof(prev));
+            } else {
+                memcpy(prev, hashes[k - 1].c_str(), sizeof(prev));
+            }
+            file.write_raw(prev, sizeof(prev));
+
+            file.write_u32(GGSD_SEGMENT_TOKENS);
+            file.write_raw(&payload_size, sizeof(payload_size));
+
+            uint8_t digest[32]; // full sha256; the header stores the first GGSD_HASH_BYTES
+            memset(digest, 0, sizeof(digest));
+            file.write_raw(digest, GGSD_HASH_BYTES); // patched below
+
+            ggsd_write_str(file, model_id);
+            ggsd_write_str(file, kv_params);
+            file.write_raw(tokens + k * GGSD_SEGMENT_TOKENS, GGSD_SEGMENT_TOKENS * sizeof(llama_token));
+
+            llama_sha256_t sha;
+            llama_sha256_init(&sha);
+            {
+                ggsd_io_write_file io(&file, &sha);
+                kv->state_write_range(io, seq_id, pos_begin, pos_end);
+            }
+            llama_sha256_final(&sha, digest);
+
+            // patch the truncated payload hash into the header
+            file.seek(GGSD_HEADER_PAYLOAD_HASH_OFFSET, SEEK_SET);
+            file.write_raw(digest, GGSD_HASH_BYTES);
+        }
+
+        std::filesystem::rename(fname_tmp, fname);
+        ++n_written;
+    }
+
+    // read, verify and replay one aligned segment file; returns false when the
+    // file is invalid / mismatched / corrupt (caller stops), IO errors throw
+    bool ggsd_read_segment(
+            llama_kv_cache * kv,
+            const std::string & session_path,
+            size_t k,
+            const std::vector<std::string> & hashes,
+            const std::string & model_id,
+            const std::string & kv_params,
+            llama_seq_id seq_id) {
+        const std::string fname = ggsd_segment_path(session_path, hashes[k]);
+
+        llama_file file(fname.c_str(), "rb");
+
+        char magic[4];
+        file.read_raw(magic, 4);
+
+        const uint32_t version   = file.read_u32();
+        const uint32_t seg_index = file.read_u32();
+
+        char prev[GGSD_HASH_HEX_LEN];
+        file.read_raw(prev, sizeof(prev));
+
+        const uint32_t n_tokens = file.read_u32();
+
+        uint64_t payload_size;
+        file.read_raw(&payload_size, sizeof(payload_size));
+
+        uint8_t payload_hash[GGSD_HASH_BYTES];
+        file.read_raw(payload_hash, sizeof(payload_hash));
+
+        if (memcmp(magic, GGSD_MAGIC, 4) != 0 || version != GGSD_VERSION ||
+                seg_index != k || n_tokens != GGSD_SEGMENT_TOKENS) {
+            LLAMA_LOG_ERROR("%s: invalid segment file %s (k = %zu)\n", __func__, fname.c_str(), k);
+            return false;
+        }
+
+        const std::string f_model_id = ggsd_read_str(file);
+        const std::string f_kv_params = ggsd_read_str(file);
+        if (f_model_id != model_id || f_kv_params != kv_params) {
+            LLAMA_LOG_ERROR("%s: segment file %s was created with a different model\n", __func__, fname.c_str());
+            return false;
+        }
+
+        // skip the tokens; the file name is the content hash of the tokens
+        file.seek(GGSD_SEGMENT_TOKENS * sizeof(llama_token), SEEK_CUR);
+
+        std::vector<uint8_t> payload(payload_size);
+        file.read_raw(payload.data(), payload.size());
+
+        // verify the payload hash
+        uint8_t digest[32];
+        {
+            llama_sha256_t sha;
+            llama_sha256_init(&sha);
+            llama_sha256_update(&sha, payload.data(), payload.size());
+            llama_sha256_final(&sha, digest);
+        }
+        if (memcmp(digest, payload_hash, GGSD_HASH_BYTES) != 0) {
+            LLAMA_LOG_ERROR("%s: segment file %s is corrupt (payload hash mismatch)\n", __func__, fname.c_str());
+            return false;
+        }
+
+        ggsd_io_read_host io(payload.data(), payload.size());
+        kv->state_read_append(io, seq_id);
+
+        return true;
+    }
 } // namespace
 
 size_t llama_context::state_seq_save_incr(
@@ -228,6 +469,10 @@ size_t llama_context::state_seq_save_incr(
               llama_seq_id   seq_id,
         const llama_token * tokens,
               size_t   n_token_count) {
+    if (auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        return state_seq_save_incr_hybrid(session_path, seq_id, tokens, n_token_count, *mem);
+    }
+
     auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
     if (kv == nullptr) {
         LLAMA_LOG_ERROR("%s: incremental state save is only supported for the standard kv cache\n", __func__);
@@ -244,18 +489,9 @@ size_t llama_context::state_seq_save_incr(
         return (size_t) -1;
     }
 
-    const uint32_t n_pos_per_embd = model.hparams.n_pos_per_embd();
-
-    if (n_pos_per_embd != 1) {
-        LLAMA_LOG_ERROR("%s: incremental state save requires n_pos_per_embd == 1 (got %u)\n", __func__, n_pos_per_embd);
-        return (size_t) -1;
-    }
-
     // model identity: arch name + kv cache parameters, both part of the segment hash
     const std::string model_id = llm_arch_name(model.arch);
-    const std::string kv_params = std::string(ggml_type_name(kv->type_k())) + "|" +
-                                  std::string(ggml_type_name(kv->type_v())) + "|" +
-                                  std::to_string(n_pos_per_embd);
+    const std::string kv_params = ggsd_kv_params(model, kv);
 
     // read the session file (save-side hint only: last known chain length);
     // a corrupt or missing session simply starts a new chain. Restore does not
@@ -319,8 +555,8 @@ size_t llama_context::state_seq_save_incr(
     // write new segments starting at the fork point
     size_t n_written = 0;
     for (size_t k = k0; k < n_seg; ++k) {
-        const llama_pos pos_begin = (llama_pos) ( k       * GGSD_SEGMENT_TOKENS * n_pos_per_embd);
-        const llama_pos pos_end   = (llama_pos) ((k + 1) * GGSD_SEGMENT_TOKENS * n_pos_per_embd);
+        const llama_pos pos_begin = (llama_pos) ( k       * GGSD_SEGMENT_TOKENS);
+        const llama_pos pos_end   = (llama_pos) ((k + 1) * GGSD_SEGMENT_TOKENS);
 
         if (kv->count_cells_range(seq_id, pos_begin, pos_end) != GGSD_SEGMENT_TOKENS) {
             // partial KV cache: stop writing at the contiguous prefix
@@ -336,54 +572,7 @@ size_t llama_context::state_seq_save_incr(
             continue;
         }
 
-        // measure the payload size
-        ggsd_io_write_dummy io_dummy;
-        kv->state_write_range(io_dummy, seq_id, pos_begin, pos_end);
-        const uint64_t payload_size = io_dummy.n_bytes();
-
-        const std::string fname_tmp = fname + ".tmp";
-
-        {
-            llama_file file(fname_tmp.c_str(), "wb");
-
-            file.write_raw(GGSD_MAGIC, sizeof(GGSD_MAGIC));
-            file.write_u32(GGSD_VERSION);
-            file.write_u32((uint32_t) k);
-
-            char prev[GGSD_HASH_HEX_LEN];
-            if (k == 0) {
-                memset(prev, 0, sizeof(prev));
-            } else {
-                memcpy(prev, hashes[k - 1].c_str(), sizeof(prev));
-            }
-            file.write_raw(prev, sizeof(prev));
-
-            file.write_u32(GGSD_SEGMENT_TOKENS);
-            file.write_raw(&payload_size, sizeof(payload_size));
-
-            uint8_t digest[32]; // full sha256; the header stores the first GGSD_HASH_BYTES
-            memset(digest, 0, sizeof(digest));
-            file.write_raw(digest, GGSD_HASH_BYTES); // patched below
-
-            ggsd_write_str(file, model_id);
-            ggsd_write_str(file, kv_params);
-            file.write_raw(tokens + k * GGSD_SEGMENT_TOKENS, GGSD_SEGMENT_TOKENS * sizeof(llama_token));
-
-            llama_sha256_t sha;
-            llama_sha256_init(&sha);
-            {
-                ggsd_io_write_file io(&file, &sha);
-                kv->state_write_range(io, seq_id, pos_begin, pos_end);
-            }
-            llama_sha256_final(&sha, digest);
-
-            // patch the truncated payload hash into the header
-            file.seek(GGSD_HEADER_PAYLOAD_HASH_OFFSET, SEEK_SET);
-            file.write_raw(digest, GGSD_HASH_BYTES);
-        }
-
-        std::filesystem::rename(fname_tmp, fname);
-        ++n_written;
+        ggsd_write_segment(kv, session_path, seq_id, k, hashes, model_id, kv_params, tokens, pos_begin, pos_end, n_written);
     }
 
     // final chain length: the longest prefix of the hash chain present on disk.
@@ -399,7 +588,7 @@ size_t llama_context::state_seq_save_incr(
 
     if (n_chain == 0) {
         LLAMA_LOG_ERROR("%s: KV cache is missing the head of the sequence (pos [0, %d)) and no head segment exists, nothing saved\n",
-                __func__, (int) (GGSD_SEGMENT_TOKENS * n_pos_per_embd));
+                __func__, (int) GGSD_SEGMENT_TOKENS);
         return (size_t) -1;
     }
 
@@ -420,6 +609,174 @@ size_t llama_context::state_seq_save_incr(
     return n_chain;
 }
 
+size_t llama_context::state_seq_save_incr_hybrid(
+        const char * session_path,
+              llama_seq_id   seq_id,
+        const llama_token * tokens,
+              size_t   n_token_count,
+              llama_memory_hybrid & mem) {
+    auto * kv_attn  = mem.get_mem_attn();
+    auto * mem_recr = mem.get_mem_recr();
+
+    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        LLAMA_LOG_ERROR("%s: hybrid split save does not support SWA attention caches\n", __func__);
+        return (size_t) -1;
+    }
+
+    if (n_token_count == 0) {
+        return 0;
+    }
+
+    const std::string model_id  = llm_arch_name(model.arch);
+    const std::string kv_params = ggsd_kv_params(model, kv_attn);
+
+    const size_t n_seg = n_token_count / GGSD_SEGMENT_TOKENS;
+
+    // hash chain of aligned blocks (same identity as the standard path)
+    const std::vector<std::string> hashes = ggsd_hash_chain(model_id, kv_params, tokens, n_seg);
+
+    if (kv_attn->seq_pos_min(seq_id) != 0) {
+        LLAMA_LOG_ERROR("%s: sequence positions do not start at 0 (min pos = %d)\n",
+                __func__, (int) kv_attn->seq_pos_min(seq_id));
+        return (size_t) -1;
+    }
+
+    // aligned segments: same write loop as the standard path
+    size_t n_written = 0;
+    for (size_t k = 0; k < n_seg; ++k) {
+        const std::string fname = ggsd_segment_path(session_path, hashes[k]);
+        if (std::filesystem::exists(fname)) {
+            continue;
+        }
+
+        const llama_pos pos_begin = (llama_pos) ( k       * GGSD_SEGMENT_TOKENS);
+        const llama_pos pos_end   = (llama_pos) ((k + 1) * GGSD_SEGMENT_TOKENS);
+
+        if (kv_attn->count_cells_range(seq_id, pos_begin, pos_end) != GGSD_SEGMENT_TOKENS) {
+            break;
+        }
+
+        ggsd_write_segment(kv_attn, session_path, seq_id, k, hashes, model_id, kv_params, tokens, pos_begin, pos_end, n_written);
+    }
+
+    // longest on-disk chain prefix
+    size_t n_chain = 0;
+    for (; n_chain < n_seg; ++n_chain) {
+        if (!std::filesystem::exists(ggsd_segment_path(session_path, hashes[n_chain]))) {
+            break;
+        }
+    }
+
+    const size_t n_tail = n_token_count - n_chain * GGSD_SEGMENT_TOKENS;
+
+    // rec file: attn tail + recurrent snapshot, coverage = n_token_count.
+    // the GGSD session file is deliberately NOT touched here (pool semantics).
+    if (n_token_count >= GGSD_SEGMENT_TOKENS) {
+        const std::string chain_hash = ggsd_prefix_hash(model_id, kv_params, tokens, n_token_count);
+        const std::string fname = ggsd_rec_path(session_path, chain_hash);
+
+        bool rec_written = std::filesystem::exists(fname);
+
+        if (!rec_written) {
+            const llama_pos tail_begin = (llama_pos) (n_chain * GGSD_SEGMENT_TOKENS);
+            const llama_pos tail_end   = (llama_pos) n_token_count;
+
+            if (kv_attn->count_cells_range(seq_id, tail_begin, tail_end) != (size_t) n_tail) {
+                LLAMA_LOG_WARN("%s: attn cache missing tail cells [%d, %d), rec file skipped\n",
+                        __func__, (int) tail_begin, (int) tail_end);
+            } else {
+                ggsd_io_write_dummy io_dummy;
+                if (n_tail > 0) {
+                    kv_attn->state_write_range(io_dummy, seq_id, tail_begin, tail_end);
+                }
+                mem_recr->state_write(io_dummy, seq_id);
+                const uint64_t payload_size = io_dummy.n_bytes();
+
+                const std::string fname_tmp = fname + ".tmp";
+                {
+                    llama_file file(fname_tmp.c_str(), "wb");
+
+                    file.write_raw(GGSD_REC_MAGIC, sizeof(GGSD_REC_MAGIC));
+                    file.write_u32(GGSD_VERSION);
+                    file.write_u32((uint32_t) n_token_count);
+                    file.write_u32((uint32_t) n_tail);
+                    file.write_raw(chain_hash.c_str(), GGSD_HASH_HEX_LEN);
+                    file.write_raw(&payload_size, sizeof(payload_size));
+
+                    uint8_t digest[32];
+                    memset(digest, 0, sizeof(digest));
+                    file.write_raw(digest, GGSD_HASH_BYTES); // patched below
+
+                    ggsd_write_str(file, model_id);
+                    ggsd_write_str(file, kv_params);
+                    file.write_raw(tokens, n_token_count * sizeof(llama_token));
+
+                    llama_sha256_t sha;
+                    llama_sha256_init(&sha);
+                    {
+                        ggsd_io_write_file io(&file, &sha);
+                        if (n_tail > 0) {
+                            kv_attn->state_write_range(io, seq_id, tail_begin, tail_end);
+                        }
+                        mem_recr->state_write(io, seq_id);
+                    }
+                    llama_sha256_final(&sha, digest);
+
+                    // patch the payload hash into the header
+                    file.seek(GGSD_REC_HEADER_PAYLOAD_HASH_OFFSET, SEEK_SET);
+                    file.write_raw(digest, GGSD_HASH_BYTES);
+                }
+                std::filesystem::rename(fname_tmp, fname);
+                rec_written = true;
+            }
+        }
+
+        // dominated-parent cleanup: drop rec files whose token sequence is a
+        // strict prefix of the one just saved; gated on rec_written so the last
+        // surviving copy of the chain is never deleted when our own write failed
+        std::filesystem::path rec_dir = std::filesystem::path(session_path).parent_path();
+        if (rec_dir.empty()) {
+            rec_dir = ".";
+        }
+        if (rec_written && std::filesystem::exists(rec_dir)) {
+            for (const auto & entry : std::filesystem::directory_iterator(rec_dir)) {
+                const std::string name = entry.path().filename().string();
+                if (!ggsd_is_rec_name(name) || entry.path() == std::filesystem::path(fname)) {
+                    continue;
+                }
+                try {
+                    llama_file f(entry.path().string().c_str(), "rb");
+                    ggsd_rec_header h;
+                    if (!ggsd_rec_read_header(f, h)) {
+                        continue;
+                    }
+                    if (h.model_id != model_id || h.kv_params != kv_params) {
+                        continue;
+                    }
+                    if (h.n_tokens < n_token_count &&
+                            memcmp(h.tokens.data(), tokens, h.n_tokens * sizeof(llama_token)) == 0) {
+                        std::filesystem::remove(entry.path());
+                        LLAMA_LOG_INFO("%s: removed dominated rec file %s (%u tokens)\n",
+                                __func__, name.c_str(), h.n_tokens);
+                    }
+                } catch (...) {
+                    // unreadable file: leave it alone
+                }
+            }
+        }
+    }
+
+    if (n_seg > 0 && n_chain == 0) {
+        LLAMA_LOG_ERROR("%s: attn cache is missing the head of the sequence, nothing usable saved\n", __func__);
+        return (size_t) -1;
+    }
+
+    LLAMA_LOG_INFO("%s: wrote %zu segment(s), rec coverage %zu tokens (chain %zu)\n",
+            __func__, n_written, n_token_count, n_chain);
+
+    return n_chain;
+}
+
 size_t llama_context::state_seq_load_incr(
         const char * session_path,
               llama_seq_id   seq_id,
@@ -427,6 +784,10 @@ size_t llama_context::state_seq_load_incr(
               size_t   n_prompt_tokens,
               size_t   min_prefix_tokens,
               size_t   n_prefix_valid) {
+    if (auto * mem = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        return state_seq_load_incr_hybrid(session_path, seq_id, prompt_tokens, n_prompt_tokens, min_prefix_tokens, *mem);
+    }
+
     if (n_prompt_tokens < GGSD_SEGMENT_TOKENS) {
         return 0;
     }
@@ -442,23 +803,13 @@ size_t llama_context::state_seq_load_incr(
         return 0;
     }
 
-    if (model.hparams.n_pos_per_embd() != 1) {
-        LLAMA_LOG_ERROR("%s: incremental state load requires n_pos_per_embd == 1 (got %u)\n",
-                __func__, model.hparams.n_pos_per_embd());
-        return 0;
-    }
-
     // segment-pool semantics: the session file is not consulted. The prompt's
     // hash chain is matched directly against content-addressed segment files in
     // the directory of session_path, so prefixes persisted by any session (and
     // any sequence) are reusable (G2 / remediation R1).
 
-    const uint32_t n_pos_per_embd = model.hparams.n_pos_per_embd();
-
     const std::string model_id = llm_arch_name(model.arch);
-    const std::string kv_params = std::string(ggml_type_name(kv->type_k())) + "|" +
-                                  std::string(ggml_type_name(kv->type_v())) + "|" +
-                                  std::to_string(n_pos_per_embd);
+    const std::string kv_params = ggsd_kv_params(model, kv);
 
     const size_t n_seg = n_prompt_tokens / GGSD_SEGMENT_TOKENS;
 
@@ -502,61 +853,9 @@ size_t llama_context::state_seq_load_incr(
     size_t n_loaded = 0;
     try {
         for (size_t k = k0; k < n_seg_ok; ++k) {
-            const std::string fname = ggsd_segment_path(session_path, hashes[k]);
-
-            llama_file file(fname.c_str(), "rb");
-
-            char magic[4];
-            file.read_raw(magic, 4);
-
-            const uint32_t version   = file.read_u32();
-            const uint32_t seg_index = file.read_u32();
-
-            char prev[GGSD_HASH_HEX_LEN];
-            file.read_raw(prev, sizeof(prev));
-
-            const uint32_t n_tokens = file.read_u32();
-
-            uint64_t payload_size;
-            file.read_raw(&payload_size, sizeof(payload_size));
-
-            uint8_t payload_hash[GGSD_HASH_BYTES];
-            file.read_raw(payload_hash, sizeof(payload_hash));
-
-            if (memcmp(magic, GGSD_MAGIC, 4) != 0 || version != GGSD_VERSION ||
-                    seg_index != k || n_tokens != GGSD_SEGMENT_TOKENS) {
-                LLAMA_LOG_ERROR("%s: invalid segment file %s (k = %zu)\n", __func__, fname.c_str(), k);
+            if (!ggsd_read_segment(kv, session_path, k, hashes, model_id, kv_params, seq_id)) {
                 break;
             }
-
-            const std::string f_model_id = ggsd_read_str(file);
-            const std::string f_kv_params = ggsd_read_str(file);
-            if (f_model_id != model_id || f_kv_params != kv_params) {
-                LLAMA_LOG_ERROR("%s: segment file %s was created with a different model\n", __func__, fname.c_str());
-                break;
-            }
-
-            // skip the tokens; the file name is the content hash of the tokens
-            file.seek(GGSD_SEGMENT_TOKENS * sizeof(llama_token), SEEK_CUR);
-
-            std::vector<uint8_t> payload(payload_size);
-            file.read_raw(payload.data(), payload.size());
-
-            // verify the payload hash
-            uint8_t digest[32];
-            {
-                llama_sha256_t sha;
-                llama_sha256_init(&sha);
-                llama_sha256_update(&sha, payload.data(), payload.size());
-                llama_sha256_final(&sha, digest);
-            }
-            if (memcmp(digest, payload_hash, GGSD_HASH_BYTES) != 0) {
-                LLAMA_LOG_ERROR("%s: segment file %s is corrupt (payload hash mismatch)\n", __func__, fname.c_str());
-                break;
-            }
-
-            ggsd_io_read_host io(payload.data(), payload.size());
-            kv->state_read_append(io, seq_id);
 
             ++n_loaded;
         }
@@ -573,6 +872,150 @@ size_t llama_context::state_seq_load_incr(
     return (n_loaded + k0) * GGSD_SEGMENT_TOKENS;
 }
 
+size_t llama_context::state_seq_load_incr_hybrid(
+        const char * session_path,
+              llama_seq_id   seq_id,
+        const llama_token * prompt_tokens,
+              size_t   n_prompt_tokens,
+              size_t   min_prefix_tokens,
+              llama_memory_hybrid & mem) {
+    if (n_prompt_tokens < GGSD_SEGMENT_TOKENS) {
+        return 0;
+    }
+
+    auto * kv_attn  = mem.get_mem_attn();
+    auto * mem_recr = mem.get_mem_recr();
+
+    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        return 0;
+    }
+
+    const std::string model_id  = llm_arch_name(model.arch);
+    const std::string kv_params = ggsd_kv_params(model, kv_attn);
+
+    const size_t n_seg = n_prompt_tokens / GGSD_SEGMENT_TOKENS;
+    const std::vector<std::string> hashes = ggsd_hash_chain(model_id, kv_params, prompt_tokens, n_seg);
+
+    // differential load is not supported for hybrid (rec state pins coverage);
+    // always full replay. n_prefix_valid is ignored by design.
+    size_t n_seg_ok = 0;
+    for (; n_seg_ok < n_seg; ++n_seg_ok) {
+        if (!std::filesystem::exists(ggsd_segment_path(session_path, hashes[n_seg_ok]))) {
+            break;
+        }
+    }
+
+    // best rec candidate: header chain_hash must equal the recomputed prefix
+    // hash of the request, and segments + tail must exactly tile the coverage
+    size_t best_tokens = 0;
+    std::filesystem::path best_path;
+    ggsd_rec_header best_h;
+
+    std::filesystem::path rec_dir = std::filesystem::path(session_path).parent_path();
+    if (rec_dir.empty()) {
+        rec_dir = ".";
+    }
+    if (!std::filesystem::exists(rec_dir)) {
+        return 0;
+    }
+    for (const auto & entry : std::filesystem::directory_iterator(rec_dir)) {
+        const std::string name = entry.path().filename().string();
+        if (!ggsd_is_rec_name(name)) {
+            continue;
+        }
+        try {
+            llama_file f(entry.path().string().c_str(), "rb");
+            ggsd_rec_header h;
+            if (!ggsd_rec_read_header(f, h)) {
+                continue;
+            }
+            if (h.model_id != model_id || h.kv_params != kv_params) {
+                continue;
+            }
+            if (h.n_tokens < min_prefix_tokens || h.n_tokens > n_prompt_tokens) {
+                continue;
+            }
+            if (h.n_tokens <= best_tokens) {
+                continue;
+            }
+            if (h.chain_hash != ggsd_prefix_hash(model_id, kv_params, prompt_tokens, h.n_tokens)) {
+                continue;
+            }
+            // the tail must start exactly where the on-disk segments end
+            if (h.n_tail != h.n_tokens - n_seg_ok * GGSD_SEGMENT_TOKENS) {
+                continue;
+            }
+            best_tokens = h.n_tokens;
+            best_path   = entry.path();
+            best_h      = std::move(h);
+        } catch (...) {
+            continue;
+        }
+    }
+
+    if (best_tokens == 0) {
+        return 0;
+    }
+
+    // full replay
+    kv_attn->seq_rm(seq_id, -1, -1);
+    mem_recr->seq_rm(seq_id, -1, -1);
+
+    size_t n_loaded = 0;
+    try {
+        for (size_t k = 0; k < n_seg_ok; ++k) {
+            if (!ggsd_read_segment(kv_attn, session_path, k, hashes, model_id, kv_params, seq_id)) {
+                throw std::runtime_error("segment failed validation during replay");
+            }
+            ++n_loaded;
+        }
+
+        llama_file file(best_path.string().c_str(), "rb");
+        ggsd_rec_header h;
+        if (!ggsd_rec_read_header(file, h)) {
+            throw std::runtime_error("rec header changed on disk");
+        }
+
+        // bound the payload allocation by the remaining file size
+        if (h.payload_size > file.size() - file.tell()) {
+            throw std::runtime_error("rec payload size out of range");
+        }
+
+        std::vector<uint8_t> payload(h.payload_size);
+        file.read_raw(payload.data(), payload.size());
+
+        uint8_t digest[32];
+        {
+            llama_sha256_t sha;
+            llama_sha256_init(&sha);
+            llama_sha256_update(&sha, payload.data(), payload.size());
+            llama_sha256_final(&sha, digest);
+        }
+        if (memcmp(digest, h.payload_hash, GGSD_HASH_BYTES) != 0) {
+            LLAMA_LOG_ERROR("%s: rec file %s is corrupt (payload hash mismatch)\n",
+                    __func__, best_path.string().c_str());
+            throw std::runtime_error("rec payload hash mismatch");
+        }
+
+        // one stream, same order as save: attn tail then recurrent state
+        ggsd_io_read_host io(payload.data(), payload.size());
+        if (h.n_tail > 0) {
+            kv_attn->state_read_append(io, seq_id);
+        }
+        mem_recr->state_read(io, seq_id);
+    } catch (...) {
+        // undo the partial restore
+        kv_attn->seq_rm(seq_id, -1, -1);
+        mem_recr->seq_rm(seq_id, -1, -1);
+        throw;
+    }
+
+    LLAMA_LOG_INFO("%s: restored %zu tokens (%zu segments + %u tail tokens + rec state)\n",
+            __func__, best_tokens, n_loaded, best_h.n_tail);
+
+    return best_tokens;
+}
+
 size_t llama_context::state_seq_load_incr_estimate(
         const char * session_path,
               llama_seq_id   seq_id,
@@ -583,18 +1026,19 @@ size_t llama_context::state_seq_load_incr_estimate(
         return 0;
     }
 
+    if (auto * mem = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
+        return state_seq_estimate_hybrid(session_path, prompt_tokens, n_prompt_tokens, min_prefix_tokens, *mem);
+    }
+
     auto * kv = dynamic_cast<const llama_kv_cache *>(memory.get());
-    if (kv == nullptr || model.hparams.swa_type != LLAMA_SWA_TYPE_NONE || model.hparams.n_pos_per_embd() != 1) {
+    if (kv == nullptr || model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         return 0;
     }
 
     GGML_UNUSED(seq_id);
 
-    const uint32_t n_pos_per_embd = model.hparams.n_pos_per_embd();
     const std::string model_id = llm_arch_name(model.arch);
-    const std::string kv_params = std::string(ggml_type_name(kv->type_k())) + "|" +
-                                  std::string(ggml_type_name(kv->type_v())) + "|" +
-                                  std::to_string(n_pos_per_embd);
+    const std::string kv_params = ggsd_kv_params(model, kv);
 
     const size_t n_seg = n_prompt_tokens / GGSD_SEGMENT_TOKENS;
     const std::vector<std::string> hashes = ggsd_hash_chain(model_id, kv_params, prompt_tokens, n_seg);
@@ -608,6 +1052,77 @@ size_t llama_context::state_seq_load_incr_estimate(
 
     const size_t n_restored = n_seg_ok * GGSD_SEGMENT_TOKENS;
     return n_restored < min_prefix_tokens ? 0 : n_restored;
+}
+
+size_t llama_context::state_seq_estimate_hybrid(
+        const char * session_path,
+        const llama_token * prompt_tokens,
+              size_t   n_prompt_tokens,
+              size_t   min_prefix_tokens,
+              const llama_memory_hybrid & mem) const {
+    if (n_prompt_tokens < GGSD_SEGMENT_TOKENS) {
+        return 0;
+    }
+
+    if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        return 0;
+    }
+
+    const std::string model_id  = llm_arch_name(model.arch);
+    const std::string kv_params = ggsd_kv_params(model, mem.get_mem_attn());
+
+    // mirror the load selection: the aligned segment prefix must exist on disk,
+    // so an estimate hit is never priced on segments that cannot be replayed
+    const size_t n_seg = n_prompt_tokens / GGSD_SEGMENT_TOKENS;
+    const std::vector<std::string> hashes = ggsd_hash_chain(model_id, kv_params, prompt_tokens, n_seg);
+
+    size_t n_seg_ok = 0;
+    for (; n_seg_ok < n_seg; ++n_seg_ok) {
+        if (!std::filesystem::exists(ggsd_segment_path(session_path, hashes[n_seg_ok]))) {
+            break;
+        }
+    }
+
+    size_t best_tokens = 0;
+
+    std::filesystem::path rec_dir = std::filesystem::path(session_path).parent_path();
+    if (rec_dir.empty()) {
+        rec_dir = ".";
+    }
+    if (!std::filesystem::exists(rec_dir)) {
+        return 0;
+    }
+    for (const auto & entry : std::filesystem::directory_iterator(rec_dir)) {
+        const std::string name = entry.path().filename().string();
+        if (!ggsd_is_rec_name(name)) {
+            continue;
+        }
+        try {
+            llama_file f(entry.path().string().c_str(), "rb");
+            ggsd_rec_header h;
+            if (!ggsd_rec_read_header(f, h, /* read_tokens = */ false)) {
+                continue;
+            }
+            if (h.model_id != model_id || h.kv_params != kv_params) {
+                continue;
+            }
+            if (h.n_tokens < min_prefix_tokens || h.n_tokens > n_prompt_tokens || h.n_tokens <= best_tokens) {
+                continue;
+            }
+            if (h.chain_hash != ggsd_prefix_hash(model_id, kv_params, prompt_tokens, h.n_tokens)) {
+                continue;
+            }
+            // the tail must start exactly where the on-disk segments end
+            if (h.n_tail != h.n_tokens - n_seg_ok * GGSD_SEGMENT_TOKENS) {
+                continue;
+            }
+            best_tokens = h.n_tokens;
+        } catch (...) {
+            continue;
+        }
+    }
+
+    return best_tokens;
 }
 
 //

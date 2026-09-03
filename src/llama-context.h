@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -181,10 +182,14 @@ struct llama_context {
                 size_t   n_token_count);
 
     size_t state_seq_save_incr(const char * session_path, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count);
+    size_t state_seq_save_incr_hybrid(const char * session_path, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count, llama_memory_hybrid & mem);
     size_t state_seq_load_incr(const char * session_path, llama_seq_id seq_id, const llama_token * prompt_tokens, size_t n_prompt_tokens, size_t min_prefix_tokens, size_t n_prefix_valid);
+    size_t state_seq_load_incr_hybrid(const char * session_path, llama_seq_id seq_id, const llama_token * prompt_tokens, size_t n_prompt_tokens, size_t min_prefix_tokens, llama_memory_hybrid & mem);
     // restorable prefix length for this prompt (floor-aligned to 1024) if
     // load_incr ran with an empty sequence; hash math + one stat per segment
     size_t state_seq_load_incr_estimate(const char * session_path, llama_seq_id seq_id, const llama_token * prompt_tokens, size_t n_prompt_tokens, size_t min_prefix_tokens) const;
+    // best rec-file coverage for hybrid models; header scan only (Task 4 re-verifies tiling)
+    size_t state_seq_estimate_hybrid(const char * session_path, const llama_token * prompt_tokens, size_t n_prompt_tokens, size_t min_prefix_tokens, const llama_memory_hybrid & mem) const;
 
     //
     // perf
