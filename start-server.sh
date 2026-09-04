@@ -29,4 +29,11 @@ exec "$BIN" \
     --port "$PORT" \
     --slot-save-path "$SAVE_DIR" \
     --prompt-cache-ssd \
+    -np 4 \
+    --kv-unified \
+    --cache-ram 8192 \
+    --flash-attn auto \
+    --load-mode dio \
+    --ctx-checkpoints 8 \
+    --cont-batching \
     "$@"
