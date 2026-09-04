@@ -151,6 +151,14 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // state write/load for a subset of positions [pos_begin, pos_end)
+    // (used for incremental state save/load)
+    void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) const;
+    void state_read_append (llama_io_read_i  & io, llama_seq_id seq_id);
+
+    // number of cells of a sequence within [pos_begin, pos_end)
+    size_t count_cells_range(llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) const;
+
     //
     // llama_kv_cache specific API
     //
@@ -177,7 +185,8 @@ public:
                llama_seq_id   seq_id,
       llama_state_seq_flags   flags,
           slot_info_vec_t *   sinfos_out,
-    const slot_info_vec_t *   sinfos_in);
+    const slot_info_vec_t *   sinfos_in,
+                          bool append = false);
 
     //
     // graph_build API
@@ -343,7 +352,7 @@ private:
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr, bool append = false);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 

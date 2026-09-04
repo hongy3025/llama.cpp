@@ -2051,12 +2051,16 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    GGML_UNUSED(flags);
+
+    state_write_range(io, seq_id, 0, std::numeric_limits<llama_pos>::max());
+}
+
+void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
-
-    GGML_UNUSED(flags);
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -2082,6 +2086,13 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
+            }
+
+            // check the cell is in the requested position range
+            if (add_cell) {
+                const llama_pos pos = cells.pos_get(i);
+
+                add_cell = pos >= pos_begin && pos < pos_end;
             }
 
             if (add_cell) {
@@ -2121,7 +2132,11 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
+    state_read_sinfo(io, seq_id, flags, nullptr, nullptr, false);
+}
+
+void llama_kv_cache::state_read_append(llama_io_read_i & io, llama_seq_id seq_id) {
+    state_read_sinfo(io, seq_id, 0, nullptr, nullptr, true);
 }
 
 void llama_kv_cache::state_read_sinfo(
@@ -2129,13 +2144,12 @@ void llama_kv_cache::state_read_sinfo(
            llama_seq_id   seq_id,
   llama_state_seq_flags   flags,
       slot_info_vec_t *   sinfos_out,
-const slot_info_vec_t *   sinfos_in) {
+const slot_info_vec_t *   sinfos_in,
+                      bool append) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
-
-    GGML_UNUSED(flags);
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -2177,7 +2191,7 @@ const slot_info_vec_t *   sinfos_in) {
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, append);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2198,6 +2212,46 @@ const slot_info_vec_t *   sinfos_in) {
             (*sinfos_out)[s] = sinfo;
         }
     }
+}
+
+size_t llama_kv_cache::count_cells_range(llama_seq_id seq_id, llama_pos pos_begin, llama_pos pos_end) const {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return 0;
+    }
+
+    size_t count = 0;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            bool add_cell = true;
+
+            add_cell = add_cell && !cells.is_empty(i);
+            add_cell = add_cell && cells.seq_has(i, seq_id);
+
+            // check the cell is not SWA-masked
+            if (add_cell) {
+                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+
+                add_cell = !is_masked;
+            }
+
+            // check the cell is in the requested position range
+            if (add_cell) {
+                const llama_pos pos = cells.pos_get(i);
+
+                add_cell = pos >= pos_begin && pos < pos_end;
+            }
+
+            if (add_cell) {
+                ++count;
+            }
+        }
+    }
+
+    return count;
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
@@ -2331,16 +2385,17 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         }
     }
 }
-
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
     if (dest_seq_id != -1) {
         // single sequence
-        seq_rm(dest_seq_id, -1, -1);
-
+        if (!append) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
+
 
         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
 

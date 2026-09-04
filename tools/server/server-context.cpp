@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-context.h" // for state_seq_load_incr_estimate (GGSD autoload)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -323,7 +324,13 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        auto r = prompt_cache.peek(tokens, prompt.tokens);
+        if (r.it == prompt_cache.states.end()) {
+            // no cached prompt beats the slot's own state, nothing to do
+            return true;
+        }
+
+        const bool res = prompt_cache.consume(r, prompt, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -864,7 +871,15 @@ public:
         }
     }
 
-    server_metrics get_metrics() const {
+    void refresh_ggsd_metrics() {
+        metrics.ggsd_cache = {};
+        if (params_base.prompt_cache_ssd_max_mib == 0 || params_base.slot_save_path.empty()) return;
+        const std::string session = params_base.slot_save_path + "session___autosave__.bin";
+        llama_ggsd_cache_get_stats(ctx_tgt, session.c_str(), &metrics.ggsd_cache);
+    }
+
+    server_metrics get_metrics() {
+        refresh_ggsd_metrics();
         return metrics;
     }
 
@@ -1109,6 +1124,24 @@ private:
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+        if (params_base.prompt_cache_ssd_max_mib > 0) {
+            if (params_base.slot_save_path.empty()) {
+                SRV_ERR("%s", "--prompt-cache-ssd-max-mib requires --slot-save-path\n");
+                return false;
+            }
+            if (params_base.prompt_cache_ssd_max_mib > UINT64_MAX / (1024ULL * 1024ULL)) {
+                SRV_ERR("%s", "GGSD cache limit is out of range\n");
+                return false;
+            }
+            llama_ggsd_cache_params policy = llama_ggsd_cache_default_params();
+            policy.max_bytes = params_base.prompt_cache_ssd_max_mib * 1024ULL * 1024ULL;
+            const std::string session = params_base.slot_save_path + "session___autosave__.bin";
+            if (!llama_ggsd_cache_configure(ctx_tgt, session.c_str(), policy)) {
+                SRV_ERR("%s", "failed to configure GGSD cache hard limit\n");
+                return false;
+            }
+            llama_ggsd_cache_get_stats(ctx_tgt, session.c_str(), &metrics.ggsd_cache);
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -1362,6 +1395,11 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        if (params_base.prompt_cache_ssd && params_base.slot_save_path.empty()) {
+            SRV_WRN("%s", "--prompt-cache-ssd requires --slot-save-path, disabling\n");
+            params_base.prompt_cache_ssd = false;
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
@@ -1544,6 +1582,36 @@ private:
         return nullptr;
     }
 
+    // fire-and-forget GGSD autosave; failures only log
+    void slot_autosave(server_slot & slot, size_t n_tokens = SIZE_MAX) {
+        if (!params_base.prompt_cache_ssd || slot.task == nullptr ||
+                slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+            return;
+        }
+
+        if (slot.prompt.tokens.has_mtmd) {
+            return;
+        }
+
+        const auto & tokens = slot.prompt.tokens.get_tokens();
+        n_tokens = std::min(n_tokens, tokens.size());
+        if (n_tokens < (size_t) params_base.prompt_cache_ssd_min_prefix) {
+            return;
+        }
+
+        // the C API's session_path is the session FILE; its parent directory
+        // is the segment pool. The manual endpoint builds the same name.
+        const std::string session_file = params_base.slot_save_path + "session___autosave__.bin";
+
+        const int32_t n_segments = llama_state_seq_save_incr(ctx_tgt, session_file.c_str(),
+                slot.id, tokens.data(), n_tokens);
+        if (n_segments < 0) {
+            SLT_WRN(slot, "%s", "__GGSD__ autosave failed - ignoring\n");
+        } else {
+            SLT_INF(slot, "__GGSD__ autosave: covered %d segment(s)\n", n_segments);
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1639,12 +1707,27 @@ private:
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
+            // with GGSD enabled, arbitration must also run when the LCP path kept
+            // the slot's KV (update_cache == false) - otherwise a conversation
+            // switch reuses the partial prefix and never consults the segment pool
+            const bool do_ggsd = prompt_cache &&
+                params_base.prompt_cache_ssd && task.type == SERVER_TASK_TYPE_COMPLETION &&
+                !task.tokens.has_mtmd && !task.tokens.get_tokens().empty();
+
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
                 ret->prompt_save(*prompt_cache);
+
+                if (do_ggsd) {
+                    if (autoload_ggsd(*ret, task)) {
+                        prompt_cache->update();
+                        SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                        return ret;
+                    }
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -1653,10 +1736,86 @@ private:
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            } else if (do_ggsd) {
+                // the restore may replace the slot's conversation entirely - keep
+                // it in the RAM cache first (same rule as the f_keep < 0.5 path)
+                const int64_t t_start = ggml_time_us();
+
+                ret->prompt_save(*prompt_cache);
+
+                if (autoload_ggsd(*ret, task)) {
+                    prompt_cache->update();
+                    SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                    return ret;
+                }
+
+                prompt_cache->update();
             }
         }
 
         return ret;
+    }
+
+    // three-source arbitration for GGSD (spec: 2026-09-03-ggsd-autoload-design.md).
+    // returns true if the slot was filled from the segment pool
+    bool autoload_ggsd(server_slot & slot, const server_task & task) {
+        const auto & task_tokens = task.tokens.get_tokens();
+
+        // the pool is the parent directory of the session file
+        const std::string session_file = params_base.slot_save_path + "session___autosave__.bin";
+
+        const size_t n_slot = slot.prompt.tokens.get_common_prefix(task.tokens);
+
+        auto r_cache = prompt_cache->peek(task.tokens, slot.prompt.tokens);
+        const size_t n_cache = r_cache.it != prompt_cache->states.end()
+            ? (size_t) r_cache.it->prompt.tokens.get_common_prefix(task.tokens) : 0;
+
+        const size_t n_ggsd = ctx_tgt == nullptr ? 0 :
+            ctx_tgt->state_seq_load_incr_estimate(session_file.c_str(), slot.id,
+                    task_tokens.data(), task_tokens.size(), (size_t) params_base.prompt_cache_ssd_min_prefix);
+        const size_t n_best = std::max({n_slot, n_cache, n_ggsd});
+        if (n_best < (size_t) params_base.prompt_cache_ssd_min_prefix) {
+            return false;
+        }
+
+        if (n_ggsd >= n_best && n_ggsd - std::max(n_slot, n_cache) >= (size_t) params_base.prompt_cache_ssd_margin) {
+            size_t m_aligned = std::min(n_slot, n_ggsd) / 1024 * 1024;
+            const bool lcp_complete = n_slot > 0 && n_slot == slot.prompt.tokens.size()
+                && slot.prompt.tokens.get_tokens().size() >= m_aligned;
+
+            size_t n_restored = 0;
+            if (lcp_complete && m_aligned >= 1024) {
+                n_restored = llama_state_seq_load_incr(ctx_tgt, session_file.c_str(),
+                        slot.id, task_tokens.data(), task_tokens.size(), (size_t) params_base.prompt_cache_ssd_min_prefix, m_aligned);
+            } else {
+                m_aligned = 0;
+                n_restored = llama_state_seq_load_incr(ctx_tgt, session_file.c_str(),
+                        slot.id, task_tokens.data(), task_tokens.size(), (size_t) params_base.prompt_cache_ssd_min_prefix, 0);
+            }
+
+            if (n_restored >= (size_t) params_base.prompt_cache_ssd_min_prefix) {
+                slot.prompt.tokens = server_tokens(
+                        llama_tokens(task_tokens.begin(), task_tokens.begin() + n_restored),
+                        /* has_mtmd = */ false);
+                slot.prompt.checkpoints.clear();
+                SLT_INF(slot, "__GGSD__ autoload: restored %zu tokens (slot %zu, cache %zu)\n",
+                        n_restored, n_slot, n_cache);
+                return true;
+            }
+
+            // load_incr truncates the sequence only when it proceeds; clear
+            // unconditionally so rejection paths that leave stale KV behind
+            // are covered too, keeping the fallback prefill consistent
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+            slot.prompt_clear();
+        }
+
+        if (n_cache >= n_best) {
+            const bool res = prompt_cache->consume(r_cache, slot.prompt, ctx_tgt, ctx_dft, slot.id);
+            return res;
+        }
+
+        return false;
     }
 
     // return true if at least one slot has been cleared
@@ -2497,6 +2656,7 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    refresh_ggsd_metrics();
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
@@ -2665,6 +2825,96 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_SAVE_INCR:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    if (slot->prompt.tokens.has_mtmd) {
+                        // multimodal sequences contain LLAMA_TOKEN_NULL placeholders
+                        // that the text-only hash chain cannot represent
+                        send_error(task, "save_incr does not support multimodal (mtmd) sequences", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    std::string filename = task.slot_action.filename;
+                    std::string filepath = task.slot_action.filepath;
+
+                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+                    const int32_t n_segments = llama_state_seq_save_incr(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size());
+
+                    const int64_t t_end = ggml_time_us();
+                    const double t_save_ms = (t_end - t_start) / 1000.0;
+
+                    if (n_segments < 0) {
+                        send_error(task, "Failed to save slot state (GGSD): KV cache is missing the head of the sequence", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_incr>();
+                    res->id         = task.id;
+                    res->id_slot    = id_slot;
+                    res->filename   = filename;
+                    res->is_save    = true;
+                    res->n_segments = n_segments;
+                    res->n_tokens   = (size_t) n_segments * 1024;
+                    res->t_ms       = t_save_ms;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_RESTORE_INCR:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    std::string filename = task.slot_action.filename;
+                    std::string filepath = task.slot_action.filepath;
+
+                    const llama_tokens & tokens = task.slot_action.prompt_tokens;
+                    const size_t n_restored = llama_state_seq_load_incr(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), task.slot_action.min_prefix, 0);
+
+                    const int64_t t_end = ggml_time_us();
+                    const double t_restore_ms = (t_end - t_start) / 1000.0;
+
+                    // keep only the restored prefix in the prompt cache;
+                    // the remainder is re-processed by the next completion.
+                    // rebuilt from plain text tokens: has_mtmd must be reset
+                    // so a restored slot can be saved again (review m3)
+                    slot->prompt.tokens = server_tokens(n_restored > 0
+                            ? llama_tokens(tokens.begin(), tokens.begin() + n_restored)
+                            : llama_tokens(), /* has_mtmd = */ false);
+
+                    auto res = std::make_unique<server_task_result_slot_incr>();
+                    res->id       = task.id;
+                    res->id_slot  = id_slot;
+                    res->filename = filename;
+                    res->is_save  = false;
+                    res->n_tokens = n_restored;
+                    res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -3616,6 +3866,9 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        if (is_user_start) {
+                            slot_autosave(slot, n_tokens_start);
+                        }
                     }
                 }
 
@@ -3869,6 +4122,7 @@ private:
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
+                slot_autosave(slot);
                 send_final_response(slot);
                 slot.release();
 
@@ -3994,6 +4248,7 @@ private:
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
+                    slot_autosave(slot);
                     send_final_response(slot);
                     slot.release();
 
@@ -4777,8 +5032,11 @@ void server_routes::init_routes() {
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
         }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
+        if (action == "save_incr") {
+            return handle_slots_save_incr(req, id_slot);
+        }
+        if (action == "restore_incr") {
+            return handle_slots_restore_incr(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
@@ -5340,6 +5598,83 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_save_incr(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    std::string filename = request_data.at("filename");
+    if (!fs_validate_filename(filename)) {
+        res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    std::string filepath = params.slot_save_path + "session_" + filename + ".bin";
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_SAVE_INCR);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot  = id_slot;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = filepath;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_restore_incr(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    std::string filename = request_data.at("filename");
+    if (!fs_validate_filename(filename)) {
+        res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const std::string prompt = request_data.at("prompt").get<std::string>();
+    const size_t min_prefix = json_value(request_data, "min_prefix", 64);
+    std::string filepath = params.slot_save_path + "session_" + filename + ".bin";
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_RESTORE_INCR);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot  = id_slot;
+        task.slot_action.filename = filename;
+        task.slot_action.filepath = filepath;
+        task.slot_action.prompt_tokens = common_tokenize(ctx_server.vocab, prompt, true, true);
+        task.slot_action.min_prefix = min_prefix;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_incr*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

@@ -1562,6 +1562,16 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "ggsd_gc_runs_total", "Number of GGSD garbage collections", (double) metrics.ggsd_cache.gc_runs
+        }, {
+            "ggsd_gc_deleted_bytes_total", "GGSD bytes deleted by garbage collection", (double) metrics.ggsd_cache.gc_deleted_bytes
+        }, {
+            "ggsd_gc_failures_total", "GGSD garbage collection operation failures", (double) metrics.ggsd_cache.gc_failures
+        }, {
+            "ggsd_cache_writes_rejected_total", "GGSD cache writes rejected by quota", (double) metrics.ggsd_cache.writes_rejected
+        }, {
+            "ggsd_cache_touch_failures_total", "GGSD last-use metadata update failures", (double) metrics.ggsd_cache.touch_failures
         },
     };
 
@@ -1586,6 +1596,14 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "ggsd_cache_bytes", "Current GGSD managed bytes", (double) metrics.ggsd_cache.bytes
+        }, {
+            "ggsd_cache_limit_bytes", "Configured GGSD managed-byte hard limit", (double) metrics.ggsd_cache.limit_bytes
+        }, {
+            "ggsd_cache_segments", "Current GGSD segment objects", (double) metrics.ggsd_cache.segments
+        }, {
+            "ggsd_cache_rec_snapshots", "Current GGSD recurrent snapshot objects", (double) metrics.ggsd_cache.rec_snapshots
         },
     };
 
@@ -1616,7 +1634,6 @@ std::string server_task_result_metrics::to_metrics() {
     return prometheus.str();
 }
 
-//
 // server_task_result_slot_save_load
 //
 json server_task_result_slot_save_load::to_json() {
@@ -1640,6 +1657,28 @@ json server_task_result_slot_save_load::to_json() {
         { "timings", {
             { "restore_ms", t_ms }
         }},
+    };
+}
+
+//
+// server_task_result_slot_incr
+//
+json server_task_result_slot_incr::to_json() {
+    if (is_save) {
+        return json {
+            { "id_slot",    id_slot },
+            { "filename",   filename },
+            { "n_segments", n_segments },
+            { "n_tokens",   n_tokens },
+            { "t_ms",       t_ms },
+        };
+    }
+
+    return json {
+        { "id_slot",           id_slot },
+        { "filename",          filename },
+        { "n_tokens_restored", n_tokens },
+        { "t_ms",              t_ms },
     };
 }
 
@@ -1790,15 +1829,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+server_prompt_cache::peek_result server_prompt_cache::peek(const server_tokens & tokens_new, const server_tokens & tokens_slot) {
+    peek_result res;
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    res.it = states.end();
+
+    const int lcp_best = tokens_slot.get_common_prefix(tokens_new);
+
+    float f_keep_best = tokens_slot.size() > 0 ? float(lcp_best) / tokens_slot.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-
-    auto it_best = states.end();
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1818,20 +1859,52 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
-            it_best = it;
+            res.it = it;
         }
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    res.f_keep = f_keep_best;
+    res.f_sim  = f_sim_best;
 
-        {
-            auto & data = it_best->data.main;
+    if (res.it != states.end()) {
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", res.f_keep, res.f_sim);
+    }
+
+    return res;
+}
+
+bool server_prompt_cache::consume(peek_result & r, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    if (r.it == states.end()) {
+        return true;
+    }
+
+    SRV_TRC(" - consuming prompt from cache with f_keep = %.3f, f_sim = %.3f\n", r.f_keep, r.f_sim);
+
+    {
+        auto & data = r.it->data.main;
+
+        const size_t size = data.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        if (n != size) {
+            SRV_ERR("failed to restore state with size %zu\n", size);
+
+            return false;
+        }
+
+        data.clear();
+        data.shrink_to_fit();
+    }
+
+    {
+        auto & data = r.it->data.drft;
+
+        if (!data.empty()) {
+            GGML_ASSERT(ctx_dft);
 
             const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+                SRV_WRN("failed to restore state with size %zu\n", size);
 
                 return false;
             }
@@ -1839,30 +1912,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             data.clear();
             data.shrink_to_fit();
         }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
-        }
-
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
     }
+
+    prompt = std::move(r.it->prompt);
+
+    states.erase(r.it);
 
     return true;
 }

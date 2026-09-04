@@ -25,6 +25,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_SAVE_INCR,
+    SERVER_TASK_TYPE_SLOT_RESTORE_INCR,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -166,6 +168,10 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+
+        // used by SERVER_TASK_TYPE_SLOT_RESTORE_INCR
+        llama_tokens prompt_tokens;
+        size_t min_prefix = 64;
     };
     slot_action slot_action;
 
@@ -529,6 +535,17 @@ struct server_task_result_slot_save_load : server_task_result {
     virtual json to_json() override;
 };
 
+struct server_task_result_slot_incr : server_task_result {
+    std::string filename;
+    bool is_save; // true = save, false = load
+
+    size_t n_segments; // save: number of segments in the session chain
+    size_t n_tokens;   // save: tokens covered by the chain; load: tokens restored
+    double t_ms;
+
+    virtual json to_json() override;
+};
+
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
 
@@ -629,7 +646,18 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    struct peek_result {
+        std::list<server_prompt_cache_state>::iterator it;
+        float f_keep = 0.0f;
+        float f_sim  = 0.0f;
+    };
+
+    // find the best cached prompt for tokens_new without consuming it;
+    // it == states.end() means no candidate beats the slot's own state
+    peek_result peek(const server_tokens & tokens_new, const server_tokens & tokens_slot);
+
+    // move the peeked entry into the slot (set_data + prompt + erase)
+    bool consume(peek_result & r, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
 };

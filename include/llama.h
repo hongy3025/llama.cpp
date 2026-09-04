@@ -894,14 +894,70 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
-    // If tokens_out is NULL, only the token count is reported through n_token_count_out and no state is loaded
     LLAMA_API size_t llama_state_seq_load_file(
             struct llama_context * ctx,
                       const char * filepath,
-                    llama_seq_id   dest_seq_id,
-                     llama_token * tokens_out,
+                    llama_seq_id   seq_id,
+                   llama_token * tokens_out,
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
+
+    // GGSD managed-cache quota. A zero limit preserves unlimited behavior.
+    struct llama_ggsd_cache_params {
+        uint64_t max_bytes;
+    };
+
+    struct llama_ggsd_cache_stats {
+        uint64_t bytes;
+        uint64_t limit_bytes;
+        uint64_t segments;
+        uint64_t rec_snapshots;
+        uint64_t gc_runs;
+        uint64_t gc_deleted_bytes;
+        uint64_t gc_failures;
+        uint64_t writes_rejected;
+        uint64_t touch_failures;
+    };
+
+    LLAMA_API struct llama_ggsd_cache_params llama_ggsd_cache_default_params(void);
+    LLAMA_API bool llama_ggsd_cache_configure(struct llama_context * ctx, const char * session_path, struct llama_ggsd_cache_params params);
+    LLAMA_API bool llama_ggsd_cache_get_stats(const struct llama_context * ctx, const char * session_path, struct llama_ggsd_cache_stats * stats);
+
+    // GGSD - incremental sequence state save/load
+    //
+    // Save the KV state of a sequence as a chain of 1024-token segments,
+    // content-addressed by a hash of (model, kv params, previous hash, tokens).
+    // Segments already on disk are reused (append / fork semantics); fork
+    // detection is file-based, so KV eviction never invalidates a persisted
+    // chain. Returns the number of segments the session chain covers after
+    // the save (not the number newly written), or -1 on error.
+    // Rejected with -1: SWA caches, n_pos_per_embd != 1, sequence positions
+    // not starting at 0 (checked only when the head segment must be written),
+    // or a KV head neither on disk nor in the cache.
+    LLAMA_API int32_t llama_state_seq_save_incr(
+            struct llama_context * ctx,
+                      const char * session_path,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count);
+
+    // Restore the aligned prefix of the prompt's hash chain by matching
+    // content-addressed segment files in the directory of session_path
+    // (segment-pool semantics: segments saved by any session or sequence
+    // match; the session file itself is not read). Returns the number of
+    // tokens restored, or 0 if no match / error.
+    // n_prefix_valid: if > 0, the caller asserts the sequence already holds
+    // valid KV for tokens [0, n_prefix_valid) of prompt_tokens; those segments
+    // are skipped (not read). Must be a multiple of 1024 for exact skipping;
+    // other values are floored. 0 = full replay from the chain head.
+    LLAMA_API size_t llama_state_seq_load_incr(
+            struct llama_context * ctx,
+                      const char * session_path,
+                    llama_seq_id   seq_id,
+               const llama_token * prompt_tokens,
+                          size_t   n_prompt_tokens,
+                          size_t   min_prefix_tokens,
+                          size_t   n_prefix_valid);
 
 #define LLAMA_STATE_SEQ_FLAGS_NONE 0
 

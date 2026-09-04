@@ -7,6 +7,7 @@
 #include <clocale>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -27,6 +28,19 @@ struct llama_batch_ptr {
     llama_batch & get() { return batch; }
     const llama_batch & get() const { return batch; }
 };
+
+// GGSD incremental state tests (see docs/superpowers/specs/2026-07-31-ggsd-incremental-slot-storage-design.md)
+
+static const char * const k_incr_dir = "incr_test";
+
+static std::string session_path(const std::string & name) {
+    return std::string(k_incr_dir) + "/" + name;
+}
+
+static void incr_test_cleanup() {
+    std::filesystem::remove_all(k_incr_dir);
+    std::filesystem::create_directories(k_incr_dir);
+}
 
 static llama_tokens generate_tokens(llama_context * ctx, llama_sampler * smpl, int & n_past, int32_t n_predict, llama_seq_id seq_id) {
     llama_tokens result;
@@ -49,6 +63,125 @@ static llama_tokens generate_tokens(llama_context * ctx, llama_sampler * smpl, i
     }
 
     return result;
+}
+
+static llama_tokens make_random_tokens(struct llama_model * model, size_t n, uint32_t seed) {
+    const auto * vocab = llama_model_get_vocab(model);
+    const auto n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<llama_token> dist(0, n_vocab - 1);
+
+    llama_tokens tokens;
+    tokens.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        tokens.push_back(dist(rng));
+    }
+
+    return tokens;
+}
+
+static bool decode_tokens(llama_context * ctx, const llama_tokens & tokens, size_t i_begin, size_t i_end, llama_seq_id seq_id) {
+    llama_batch_ptr batch(512, 0, 1);
+
+    for (size_t i = i_begin; i < i_end; ) {
+        const size_t n = std::min<size_t>(512, i_end - i);
+
+        common_batch_clear(batch.get());
+        for (size_t j = 0; j < n; ++j) {
+            common_batch_add(batch.get(), tokens[i + j], (llama_pos) (i + j), {seq_id}, true);
+        }
+
+        if (llama_decode(ctx, batch.get())) {
+            LOG_ERR("%s: failed to decode tokens [%zu, %zu)\n", __func__, i, i + n);
+            return false;
+        }
+
+        i += n;
+    }
+
+    return true;
+}
+
+// the GGSD tests decode 3000+ tokens, which needs a context larger than n_ctx_train
+static llama_context_params incr_context_params(const struct common_params & params) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx   = 8192;
+    params_ctx.n_batch = 512;
+    return params_ctx;
+}
+
+// seg files live under <dir>/seg/<hh>/<hash> (content-addressed shards)
+static size_t count_segment_files() {
+    size_t n = 0;
+    const std::filesystem::path root = std::filesystem::path(k_incr_dir) / "seg";
+    if (!std::filesystem::exists(root)) {
+        return 0;
+    }
+    for (const auto & shard : std::filesystem::directory_iterator(root)) {
+        if (!shard.is_directory()) {
+            continue;
+        }
+        for (const auto & entry : std::filesystem::directory_iterator(shard.path())) {
+            if (entry.is_regular_file()) {
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
+static std::string segment_file_by_index(uint32_t idx) {
+    const std::filesystem::path root = std::filesystem::path(k_incr_dir) / "seg";
+    if (!std::filesystem::exists(root)) {
+        return "";
+    }
+    for (const auto & shard : std::filesystem::directory_iterator(root)) {
+        if (!shard.is_directory()) {
+            continue;
+        }
+        for (const auto & entry : std::filesystem::directory_iterator(shard.path())) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            std::ifstream f(entry.path(), std::ios::binary);
+            char     magic[4];
+            uint32_t version;
+            uint32_t seg_index;
+            f.read(magic, 4);
+            f.read((char *) &version, sizeof(version));
+            f.read((char *) &seg_index, sizeof(seg_index));
+            if (seg_index == idx) {
+                return entry.path().string();
+            }
+        }
+    }
+    return "";
+}
+
+static bool compare_generation(
+        struct llama_model * model,
+        const struct common_params & params,
+        llama_context * ctx,
+        int n_past,
+        const llama_tokens & expected_result) {
+    auto sparams = llama_sampler_chain_default_params();
+    auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
+    llama_sampler_chain_add(smpl.get(), llama_sampler_init_dist(params.sampling.seed));
+
+    int n_past_local = n_past;
+    auto result = generate_tokens(ctx, smpl.get(), n_past_local, params.n_predict, 0);
+    if (result.empty()) {
+        return false;
+    }
+
+    if (result != expected_result) {
+        LOG_ERR("\n%s: error: generation differs from expected\n", __func__);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
 }
 
 // Test 1: baseline
@@ -354,6 +487,497 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
     return true;
 }
 
+// Test 5: GGSD save/load roundtrip
+// - decode 2500 tokens, save (2 segments)
+// - restore 2048 tokens in a fresh context, decode the remainder, generate
+// - compare the generation against the reference (same KV -> same logits)
+static bool test_incr_roundtrip(struct llama_model * model, const struct common_params & params) {
+    incr_test_cleanup();
+
+    const std::string session = session_path("session_roundtrip.bin");
+    const llama_tokens tokens = make_random_tokens(model, 2500, 1234);
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx.get(), tokens, 0, tokens.size(), 0)) {
+        return false;
+    }
+
+    const int32_t n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
+    if (n_segments != 2) {
+        LOG_ERR("\n%s: error: expected 2 segments after first save, got %d\n", __func__, n_segments);
+        return false;
+    }
+
+    // reference generation
+    auto sparams = llama_sampler_chain_default_params();
+    auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
+    llama_sampler_chain_add(smpl.get(), llama_sampler_init_dist(params.sampling.seed));
+
+    int n_past_ref = (int) tokens.size();
+    const llama_tokens expected_result = generate_tokens(ctx.get(), smpl.get(), n_past_ref, params.n_predict, 0);
+    if (expected_result.empty()) {
+        return false;
+    }
+
+    // fresh context: restore the aligned prefix, decode the remainder
+    auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+
+    const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
+    if (n_restored != 2048) {
+        LOG_ERR("\n%s: error: expected 2048 tokens restored, got %zu\n", __func__, n_restored);
+        return false;
+    }
+
+    if (!decode_tokens(ctx2.get(), tokens, n_restored, tokens.size(), 0)) {
+        return false;
+    }
+
+    return compare_generation(model, params, ctx2.get(), (int) tokens.size(), expected_result);
+}
+
+// Test 6: GGSD incremental save
+// - decode 1500 tokens, save -> 1 segment
+// - decode 1100 more, save -> 2 segments, only 1 new file
+// - restore -> 2048 tokens
+static bool test_incr_append(struct llama_model * model, const struct common_params & params) {
+    incr_test_cleanup();
+
+    const std::string session = session_path("session_append.bin");
+    const llama_tokens tokens = make_random_tokens(model, 2600, 4321);
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx.get(), tokens, 0, 1500, 0)) {
+        return false;
+    }
+
+    int32_t n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), 1500);
+    if (n_segments != 1) {
+        LOG_ERR("\n%s: error: expected 1 segment after first save, got %d\n", __func__, n_segments);
+        return false;
+    }
+    if (count_segment_files() != 1) {
+        LOG_ERR("\n%s: error: expected 1 segment file, got %zu\n", __func__, count_segment_files());
+        return false;
+    }
+
+    if (!decode_tokens(ctx.get(), tokens, 1500, 2600, 0)) {
+        return false;
+    }
+
+    n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), 2600);
+    if (n_segments != 2) {
+        LOG_ERR("\n%s: error: expected 2 segments after append save, got %d\n", __func__, n_segments);
+        return false;
+    }
+    if (count_segment_files() != 2) {
+        LOG_ERR("\n%s: error: expected 2 segment files after append, got %zu\n", __func__, count_segment_files());
+        return false;
+    }
+
+    auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+
+    const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
+    if (n_restored != 2048) {
+        LOG_ERR("\n%s: error: expected 2048 tokens restored, got %zu\n", __func__, n_restored);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+// Test 7: GGSD fork
+// - chain A: 3000 tokens, save -> 2 segments
+// - chain B: A[0..1500) + 1500 new tokens, save -> 2 segments, 1 shared file
+// - restore with B -> 2048 tokens (matched chain)
+// - restore with A -> 2048 tokens (orphaned chain still on disk)
+static bool test_incr_fork(struct llama_model * model, const struct common_params & params) {
+    incr_test_cleanup();
+
+    const std::string session = session_path("session_fork.bin");
+    const llama_tokens tokens_a = make_random_tokens(model, 3000, 111);
+    const llama_tokens tokens_b_tail = make_random_tokens(model, 1500, 222);
+
+    llama_tokens tokens_b = tokens_a;
+    tokens_b.resize(1500);
+    tokens_b.insert(tokens_b.end(), tokens_b_tail.begin(), tokens_b_tail.end());
+
+    auto ctx_a = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx_a.get(), tokens_a, 0, tokens_a.size(), 0)) {
+        return false;
+    }
+    const int32_t n_segments_a = llama_state_seq_save_incr(ctx_a.get(), session.c_str(), 0, tokens_a.data(), tokens_a.size());
+    if (n_segments_a != 2 || count_segment_files() != 2) {
+        LOG_ERR("\n%s: error: chain A expected 2 segments/2 files, got %d/%zu\n", __func__, n_segments_a, count_segment_files());
+        return false;
+    }
+
+    auto ctx_b = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx_b.get(), tokens_b, 0, tokens_b.size(), 0)) {
+        return false;
+    }
+    const int32_t n_segments_b = llama_state_seq_save_incr(ctx_b.get(), session.c_str(), 0, tokens_b.data(), tokens_b.size());
+    if (n_segments_b != 2) {
+        LOG_ERR("\n%s: error: chain B expected 2 segments, got %d\n", __func__, n_segments_b);
+        return false;
+    }
+    if (count_segment_files() != 3) {
+        LOG_ERR("\n%s: error: expected 3 segment files after fork (1 shared + 2 unique), got %zu\n", __func__, count_segment_files());
+        return false;
+    }
+
+    // restore chain B (the session tail)
+    auto ctx_rb = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    const size_t n_restored_b = llama_state_seq_load_incr(ctx_rb.get(), session.c_str(), 0, tokens_b.data(), tokens_b.size(), 64, 0);
+    if (n_restored_b != 2048) {
+        LOG_ERR("\n%s: error: chain B restore expected 2048 tokens, got %zu\n", __func__, n_restored_b);
+        return false;
+    }
+
+    // restore chain A (orphaned but still on disk)
+    auto ctx_ra = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    const size_t n_restored_a = llama_state_seq_load_incr(ctx_ra.get(), session.c_str(), 0, tokens_a.data(), tokens_a.size(), 64, 0);
+    if (n_restored_a != 2048) {
+        LOG_ERR("\n%s: error: chain A restore expected 2048 tokens, got %zu\n", __func__, n_restored_a);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+// Test 7b: GGSD saved prefix survives a child save
+// - save a 1500-token prefix, then save a 2000-token child
+// - restore a sibling that diverges after the saved prefix
+static bool test_incr_fork_prefix(struct llama_model * model, const struct common_params & params) {
+    incr_test_cleanup();
+
+    const std::string session = session_path("session_fork_prefix.bin");
+    const llama_tokens prefix = make_random_tokens(model, 1500, 333);
+    const llama_tokens tail_a = make_random_tokens(model, 500, 444);
+    const llama_tokens tail_b = make_random_tokens(model, 500, 555);
+
+    llama_tokens tokens_a = prefix;
+    tokens_a.insert(tokens_a.end(), tail_a.begin(), tail_a.end());
+
+    llama_tokens tokens_b = prefix;
+    tokens_b.insert(tokens_b.end(), tail_b.begin(), tail_b.end());
+
+    auto ctx_a = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx_a.get(), tokens_a, 0, prefix.size(), 0)) {
+        return false;
+    }
+    if (llama_state_seq_save_incr(ctx_a.get(), session.c_str(), 0, tokens_a.data(), prefix.size()) < 1) {
+        return false;
+    }
+    if (!decode_tokens(ctx_a.get(), tokens_a, prefix.size(), tokens_a.size(), 0)) {
+        return false;
+    }
+    if (llama_state_seq_save_incr(ctx_a.get(), session.c_str(), 0, tokens_a.data(), tokens_a.size()) < 1) {
+        return false;
+    }
+
+    auto ctx_b = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    const size_t n_restored = llama_state_seq_load_incr(ctx_b.get(), session.c_str(), 0,
+            tokens_b.data(), tokens_b.size(), 1024, 0);
+    if (n_restored < 1024) {
+        LOG_ERR("\n%s: error: expected the saved sibling prefix to restore, got %zu tokens\n", __func__, n_restored);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+// Test 8: GGSD partial KV
+// - decode 3000 tokens, save -> 2 segments
+// - evict cells [1024, 3000), save -> chain is preserved (files on disk stay
+//   valid regardless of KV eviction; R2) and nothing new is written
+// - restore with the full prompt -> 2048 tokens (both segments are on disk)
+// - evict the head cells [0, 1024), save to the original session -> still 2
+//   (zero writes; the head file on disk keeps the chain alive, R2)
+// - evict part of the head cells [512, 1024) in a fresh context, save to a
+//   fresh session -> error (-1): the head segment can neither be loaded from
+//   disk (no file) nor written (incomplete cells) - the R3 head-missing rule
+static bool test_incr_partial(struct llama_model * model, const struct common_params & params) {
+    incr_test_cleanup();
+
+    const std::string session = session_path("session_partial.bin");
+    const llama_tokens tokens = make_random_tokens(model, 3000, 555);
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx.get(), tokens, 0, tokens.size(), 0)) {
+        return false;
+    }
+
+    int32_t n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
+    if (n_segments != 2) {
+        LOG_ERR("\n%s: error: expected 2 segments, got %d\n", __func__, n_segments);
+        return false;
+    }
+
+    // evict the tail of the KV cache
+    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 1024, 3000);
+
+    n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
+    if (n_segments != 2) {
+        LOG_ERR("\n%s: error: expected chain to be preserved after eviction, got %d\n", __func__, n_segments);
+        return false;
+    }
+
+    auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
+    if (n_restored != 2048) {
+        LOG_ERR("\n%s: error: expected 2048 tokens restored, got %zu\n", __func__, n_restored);
+        return false;
+    }
+    // evict the whole head: the chain on disk is untouched, save is a no-op (R2)
+    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 0, 1024);
+
+    n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
+    if (n_segments != 2) {
+        LOG_ERR("\n%s: error: expected chain to be preserved after head eviction, got %d\n", __func__, n_segments);
+        return false;
+    }
+    // R3 head-missing rule: empty the segment pool first, otherwise the head
+    // file written by the chain above would keep the save alive
+    incr_test_cleanup();
+    // head segment present in the KV cache only partially (pos base still 0),
+    // no file on disk, cannot be written
+    auto ctx3 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx3.get(), tokens, 0, tokens.size(), 0)) {
+        return false;
+    }
+    llama_memory_seq_rm(llama_get_memory(ctx3.get()), 0, 512, 1024);
+
+    const std::string session_fresh = session_path("session_partial_fresh.bin");
+    const int32_t n_segments_err = llama_state_seq_save_incr(ctx3.get(), session_fresh.c_str(), 0, tokens.data(), tokens.size());
+    if (n_segments_err != -1) {
+        LOG_ERR("\n%s: error: expected save to fail with head missing, got %d\n", __func__, n_segments_err);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+// Test 9: GGSD corrupt / missing segment
+// - decode 2500 tokens, save -> 2 segments
+// - flip a byte in the payload of segment 1 -> restore stops at it (1024)
+// - delete segment 1 -> restore stops at the missing file (1024)
+// - corrupt session file -> restore is unaffected (pool semantics, R1)
+static bool test_incr_corrupt(struct llama_model * model, const struct common_params & params) {
+    incr_test_cleanup();
+
+    const std::string session = session_path("session_corrupt.bin");
+    const llama_tokens tokens = make_random_tokens(model, 2500, 777);
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx.get(), tokens, 0, tokens.size(), 0)) {
+        return false;
+    }
+    if (llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size()) != 2) {
+        return false;
+    }
+
+    // flip the last byte of segment 1 (inside the payload)
+    {
+        const std::string fname = segment_file_by_index(1);
+        if (fname.empty()) {
+            LOG_ERR("\n%s: error: segment 1 file not found\n", __func__);
+            return false;
+        }
+
+        std::fstream f(fname, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekg(-1, std::ios::end);
+        char c;
+        f.read(&c, 1);
+        c ^= 0xFF;
+        f.seekp(-1, std::ios::end);
+        f.write(&c, 1);
+    }
+
+
+    auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
+    if (n_restored != 1024) {
+        LOG_ERR("\n%s: error: expected 1024 tokens restored (stop at corrupt segment), got %zu\n", __func__, n_restored);
+        return false;
+    }
+    // missing mid-chain segment: restore stops at the first missing file
+    // (corrupt segment above was not rewritten, so segment 1 is present but
+    // bad; delete it and the verified prefix is still 1024)
+    const std::string fname_missing = segment_file_by_index(1);
+    if (fname_missing.empty()) {
+        LOG_ERR("\n%s: error: segment 1 file not found\n", __func__);
+        return false;
+    }
+    std::filesystem::remove(fname_missing);
+
+    const size_t n_restored2 = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
+    if (n_restored2 != 1024) {
+        LOG_ERR("\n%s: error: expected 1024 tokens restored despite missing segment (pool semantics), got %zu\n", __func__, n_restored2);
+        return false;
+    }
+
+    // corrupt session file: restore is unaffected (the session is never read)
+    {
+        std::ofstream f(session, std::ios::binary);
+        f << "garbage";
+    }
+
+    const size_t n_restored3 = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
+    if (n_restored3 != 1024) {
+        LOG_ERR("\n%s: error: expected 1024 tokens restored despite corrupt session (pool semantics), got %zu\n", __func__, n_restored3);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+// Test 10: GGSD kv params mismatch and min_prefix
+// - save with an F32 K cache -> hashes differ from the default F16 cache
+// - restore from the default cache -> 0 tokens (cross-config mismatch)
+// - min_prefix: restore with a shorter prompt, threshold above the match -> 0
+static bool test_incr_mismatch(struct llama_model * model, const struct common_params & params) {
+    incr_test_cleanup();
+
+    const std::string session = session_path("session_kv.bin");
+    const llama_tokens tokens = make_random_tokens(model, 2048, 999);
+
+    auto params_ctx = incr_context_params(params);
+    params_ctx.type_k = GGML_TYPE_F32;
+
+    auto ctx_f32 = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!decode_tokens(ctx_f32.get(), tokens, 0, tokens.size(), 0)) {
+        return false;
+    }
+    if (llama_state_seq_save_incr(ctx_f32.get(), session.c_str(), 0, tokens.data(), tokens.size()) != 2) {
+        return false;
+    }
+
+    // restore with the default F16 cache: kv_params is part of the hash, no match
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    const size_t n_restored = llama_state_seq_load_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
+    if (n_restored != 0) {
+        LOG_ERR("\n%s: error: expected 0 tokens restored (kv params mismatch), got %zu\n", __func__, n_restored);
+        return false;
+    }
+
+    // restore with the F32 cache and a shorter prompt: match is floor-aligned to 1024
+    const size_t n_restored2 = llama_state_seq_load_incr(ctx_f32.get(), session.c_str(), 0, tokens.data(), 1500, 1024, 0);
+    if (n_restored2 != 1024) {
+        LOG_ERR("\n%s: error: expected 1024 tokens restored, got %zu\n", __func__, n_restored2);
+        return false;
+    }
+
+    // min_prefix above the match -> no-op
+    const size_t n_restored3 = llama_state_seq_load_incr(ctx_f32.get(), session.c_str(), 0, tokens.data(), 1500, 2000, 0);
+    if (n_restored3 != 0) {
+        LOG_ERR("\n%s: error: expected 0 tokens restored (min_prefix), got %zu\n", __func__, n_restored3);
+        return false;
+    }
+
+    // nonexistent session -> no-op
+    const size_t n_restored4 = llama_state_seq_load_incr(ctx.get(), session_path("session_none.bin").c_str(), 0, tokens.data(), tokens.size(), 64, 0);
+    if (n_restored4 != 0) {
+        LOG_ERR("\n%s: error: expected 0 tokens restored (no session), got %zu\n", __func__, n_restored4);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+// Test 11: GGSD differential replay
+// - decode 2500, save -> 2 segments
+// - fresh context decodes the first 1500 tokens, restore with
+//   n_prefix_valid = 1024 -> 2048 restored, generation matches reference
+// - delete segment 0's file, restore again with n_prefix_valid = 1024 ->
+//   still 2048 (skipped segments are never read)
+// - same deletion with n_prefix_valid = 0 -> 0 restored (head missing)
+static bool test_incr_differential(struct llama_model * model, const struct common_params & params) {
+    incr_test_cleanup();
+
+    const std::string session = session_path("session_diff.bin");
+    const llama_tokens tokens = make_random_tokens(model, 2500, 314);
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx.get(), tokens, 0, tokens.size(), 0)) {
+        return false;
+    }
+    if (llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size()) != 2) {
+        return false;
+    }
+
+    // reference generation from the full context
+    auto sparams = llama_sampler_chain_default_params();
+    auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
+    llama_sampler_chain_add(smpl.get(), llama_sampler_init_dist(params.sampling.seed));
+    int n_past_ref = (int) tokens.size();
+    const llama_tokens expected = generate_tokens(ctx.get(), smpl.get(), n_past_ref, params.n_predict, 0);
+    if (expected.empty()) {
+        return false;
+    }
+
+    // differential restore in a fresh context that already holds [0, 1500)
+    auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx2.get(), tokens, 0, 1500, 0)) {
+        return false;
+    }
+
+    const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0,
+            tokens.data(), tokens.size(), 64, 1024);
+    if (n_restored != 2048) {
+        LOG_ERR("\n%s: error: expected 2048 restored (differential), got %zu\n", __func__, n_restored);
+        return false;
+    }
+    if (!decode_tokens(ctx2.get(), tokens, n_restored, tokens.size(), 0)) {
+        return false;
+    }
+    if (!compare_generation(model, params, ctx2.get(), (int) tokens.size(), expected)) {
+        return false;
+    }
+
+    // delete segment 0: skipped segments must not be read
+    const std::string fname0 = segment_file_by_index(0);
+    if (fname0.empty()) {
+        LOG_ERR("\n%s: error: segment 0 file not found\n", __func__);
+        return false;
+    }
+    std::filesystem::remove(fname0);
+
+    auto ctx3 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx3.get(), tokens, 0, 1500, 0)) {
+        return false;
+    }
+    const size_t n_restored2 = llama_state_seq_load_incr(ctx3.get(), session.c_str(), 0,
+            tokens.data(), tokens.size(), 64, 1024);
+    if (n_restored2 != 2048) {
+        LOG_ERR("\n%s: error: expected 2048 restored despite deleted head (differential), got %zu\n", __func__, n_restored2);
+        return false;
+    }
+
+    if (!decode_tokens(ctx3.get(), tokens, n_restored2, tokens.size(), 0)) {
+        return false;
+    }
+    if (!compare_generation(model, params, ctx3.get(), (int) tokens.size(), expected)) {
+        return false;
+    }
+    // full-replay mode sees the deleted head and restores nothing
+    auto ctx4 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    const size_t n_restored3 = llama_state_seq_load_incr(ctx4.get(), session.c_str(), 0,
+            tokens.data(), tokens.size(), 64, 0);
+    if (n_restored3 != 0) {
+        LOG_ERR("\n%s: error: expected 0 restored (deleted head, full replay), got %zu\n", __func__, n_restored3);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
 
 // Test 6/7: seq copy (scatter)
 // - decode the same prefix on two sequences, interleaving seq 0 cells between the seq 1 cells
@@ -587,6 +1211,39 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
 
     // Test 8: state blob round-trip
     if (!test_state_roundtrip(model, params, tokens)) {
+        return false;
+    }
+
+    // GGSD incremental state tests
+    if (!test_incr_roundtrip(model, params)) {
+        return false;
+    }
+
+    if (!test_incr_append(model, params)) {
+        return false;
+    }
+
+    if (!test_incr_fork(model, params)) {
+        return false;
+    }
+
+    if (!test_incr_fork_prefix(model, params)) {
+        return false;
+    }
+
+    if (!test_incr_partial(model, params)) {
+        return false;
+    }
+
+    if (!test_incr_corrupt(model, params)) {
+        return false;
+    }
+
+    if (!test_incr_mismatch(model, params)) {
+        return false;
+    }
+
+    if (!test_incr_differential(model, params)) {
         return false;
     }
 

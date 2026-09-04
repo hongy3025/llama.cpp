@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <charconv>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -3640,6 +3641,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (!params.slot_save_path.empty() && params.slot_save_path[params.slot_save_path.size() - 1] != DIRECTORY_SEPARATOR) {
                 params.slot_save_path += DIRECTORY_SEPARATOR;
             }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prompt-cache-ssd"},
+        {"--no-prompt-cache-ssd"},
+        "enable GGSD autoload and autosave of prompt prefixes on disk (requires --slot-save-path)",
+        [](common_params & params, bool value) {
+            params.prompt_cache_ssd = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prompt-cache-ssd-max-mib"}, "N",
+        "set the GGSD managed-cache hard limit in MiB (default: 0, unlimited)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) {
+                throw std::invalid_argument("GGSD cache limit must be decimal digits");
+            }
+            uint64_t mib = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), mib);
+            if (parsed.ec != std::errc() || parsed.ptr != value.data() + value.size() ||
+                    mib > UINT64_MAX / (1024ULL * 1024ULL)) {
+                throw std::invalid_argument("GGSD cache limit is out of range");
+            }
+            params.prompt_cache_ssd_max_mib = mib;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_SSD_MAX_MIB"));
+    add_opt(common_arg(
+        {"--prompt-cache-ssd-min-prefix"}, "N",
+        string_format("min reusable prefix tokens to trigger GGSD autoload/autosave (default: %d)", params.prompt_cache_ssd_min_prefix),
+        [](common_params & params, int value) {
+            params.prompt_cache_ssd_min_prefix = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prompt-cache-ssd-margin"}, "N",
+        string_format("GGSD candidate must beat the runner-up by this many tokens (default: %d)", params.prompt_cache_ssd_margin),
+        [](common_params & params, int value) {
+            params.prompt_cache_ssd_margin = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
