@@ -51,7 +51,7 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 **没有新的 API、没有新的请求字段**。你照常发 `/completion`;区别只在服务端内部:
 
 - **自动落盘(autosave)**:服务端在用户消息边界保存可分叉前缀,并在 completion 结束、槽位释放时保存完整序列(含生成部分)到共享 session `__autosave__`;不足 1024 token 或内容已存在时是近零成本 no-op;失败(磁盘满等)只打日志,不影响请求;
-- **自动恢复(autoload)**:命中时服务端日志出现 `autoloaded <N> GGSD tokens (slot X, cache Y)`,响应里 `timings.prompt_n` 只覆盖恢复前缀之后的 token 数;
+- **自动恢复(autoload)**:命中时服务端日志出现 `__GGSD__ autoload: restored <N> tokens (slot X, cache Y)`,响应里 `timings.prompt_n` 只覆盖恢复前缀之后的 token 数;
 - 未命中时:与今天完全一样,槽位续用或全量 prefill。
 
 实测证据(135M 模型,约 2000 token 的 prompt:第一次 completion 触发自动落盘,重启服务端后重发同一请求):
@@ -59,7 +59,7 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 ```
 关闭开关:  prompt_n = 2001   (全量 prefill)
 开启开关:  prompt_n = 977    (前 1024 token 从磁盘自动恢复)
-          日志: autoload_ggs: slot 3: autoloaded 1024 GGSD tokens (slot 0, cache 0)
+          日志: slot autoload_ggs: id  3 | task -1 | __GGSD__ autoload: restored 1024 tokens (slot 0, cache 0)
 ```
 
 手动端点 `POST /slots/{id}?action=restore_incr` 的语义不变,两者互不干扰:手动调用显式指定目标槽位与 min_prefix;自动路径只在槽位分配瞬间、按统一阈值决策。

@@ -1487,9 +1487,9 @@ private:
         const int32_t n_segments = llama_state_seq_save_incr(ctx_tgt, session_file.c_str(),
                 slot.id, tokens.data(), n_tokens);
         if (n_segments < 0) {
-            SLT_WRN(slot, "%s", "GGSD autosave failed - ignoring\n");
+            SLT_WRN(slot, "%s", "__GGSD__ autosave failed - ignoring\n");
         } else {
-            SLT_INF(slot, "GGSD autosave: session __autosave__ covers %d segment(s)\n", n_segments);
+            SLT_INF(slot, "__GGSD__ autosave: covered %d segment(s)\n", n_segments);
         }
     }
 
@@ -1679,8 +1679,8 @@ private:
                         llama_tokens(task_tokens.begin(), task_tokens.begin() + n_restored),
                         /* has_mtmd = */ false);
                 slot.prompt.checkpoints.clear();
-                SRV_INF("slot %d: autoloaded %zu GGSD tokens (slot %zu, cache %zu)\n",
-                        slot.id, n_restored, n_slot, n_cache);
+                SLT_INF(slot, "__GGSD__ autoload: restored %zu tokens (slot %zu, cache %zu)\n",
+                        n_restored, n_slot, n_cache);
                 return true;
             }
 
