@@ -1587,6 +1587,13 @@ private:
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
+            // with GGSD enabled, arbitration must also run when the LCP path kept
+            // the slot's KV (update_cache == false) - otherwise a conversation
+            // switch reuses the partial prefix and never consults the segment pool
+            const bool do_ggsd = prompt_cache &&
+                params_base.prompt_cache_ssd && task.type == SERVER_TASK_TYPE_COMPLETION &&
+                !task.tokens.has_mtmd && !task.tokens.get_tokens().empty();
+
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
@@ -1594,7 +1601,7 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (params_base.prompt_cache_ssd && !task.tokens.has_mtmd && !task.tokens.get_tokens().empty()) {
+                if (do_ggsd) {
                     if (autoload_ggsd(*ret, task)) {
                         prompt_cache->update();
                         SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
@@ -1609,6 +1616,20 @@ private:
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            } else if (do_ggsd) {
+                // the restore may replace the slot's conversation entirely - keep
+                // it in the RAM cache first (same rule as the f_keep < 0.5 path)
+                const int64_t t_start = ggml_time_us();
+
+                ret->prompt_save(*prompt_cache);
+
+                if (autoload_ggsd(*ret, task)) {
+                    prompt_cache->update();
+                    SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                    return ret;
+                }
+
+                prompt_cache->update();
             }
         }
 
