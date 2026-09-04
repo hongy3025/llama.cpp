@@ -1562,6 +1562,16 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "ggsd_gc_runs_total", "Number of GGSD garbage collections", (double) metrics.ggsd_cache.gc_runs
+        }, {
+            "ggsd_gc_deleted_bytes_total", "GGSD bytes deleted by garbage collection", (double) metrics.ggsd_cache.gc_deleted_bytes
+        }, {
+            "ggsd_gc_failures_total", "GGSD garbage collection operation failures", (double) metrics.ggsd_cache.gc_failures
+        }, {
+            "ggsd_cache_writes_rejected_total", "GGSD cache writes rejected by quota", (double) metrics.ggsd_cache.writes_rejected
+        }, {
+            "ggsd_cache_touch_failures_total", "GGSD last-use metadata update failures", (double) metrics.ggsd_cache.touch_failures
         },
     };
 
@@ -1586,6 +1596,14 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "ggsd_cache_bytes", "Current GGSD managed bytes", (double) metrics.ggsd_cache.bytes
+        }, {
+            "ggsd_cache_limit_bytes", "Configured GGSD managed-byte hard limit", (double) metrics.ggsd_cache.limit_bytes
+        }, {
+            "ggsd_cache_segments", "Current GGSD segment objects", (double) metrics.ggsd_cache.segments
+        }, {
+            "ggsd_cache_rec_snapshots", "Current GGSD recurrent snapshot objects", (double) metrics.ggsd_cache.rec_snapshots
         },
     };
 

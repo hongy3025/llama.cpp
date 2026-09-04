@@ -489,6 +489,7 @@ struct server_metrics {
     void add_prompt_cached(uint64_t n_tokens) {
         n_prompt_cached += n_tokens;
     }
+    llama_ggsd_cache_stats ggsd_cache = {};
 };
 
 //

@@ -823,7 +823,15 @@ public:
         }
     }
 
-    server_metrics get_metrics() const {
+    void refresh_ggsd_metrics() {
+        metrics.ggsd_cache = {};
+        if (params_base.prompt_cache_ssd_max_mib == 0 || params_base.slot_save_path.empty()) return;
+        const std::string session = params_base.slot_save_path + "session___autosave__.bin";
+        llama_ggsd_cache_get_stats(ctx_tgt, session.c_str(), &metrics.ggsd_cache);
+    }
+
+    server_metrics get_metrics() {
+        refresh_ggsd_metrics();
         return metrics;
     }
 
@@ -1068,6 +1076,24 @@ private:
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+        if (params_base.prompt_cache_ssd_max_mib > 0) {
+            if (params_base.slot_save_path.empty()) {
+                SRV_ERR("%s", "--prompt-cache-ssd-max-mib requires --slot-save-path\n");
+                return false;
+            }
+            if (params_base.prompt_cache_ssd_max_mib > UINT64_MAX / (1024ULL * 1024ULL)) {
+                SRV_ERR("%s", "GGSD cache limit is out of range\n");
+                return false;
+            }
+            llama_ggsd_cache_params policy = llama_ggsd_cache_default_params();
+            policy.max_bytes = params_base.prompt_cache_ssd_max_mib * 1024ULL * 1024ULL;
+            const std::string session = params_base.slot_save_path + "session___autosave__.bin";
+            if (!llama_ggsd_cache_configure(ctx_tgt, session.c_str(), policy)) {
+                SRV_ERR("%s", "failed to configure GGSD cache hard limit\n");
+                return false;
+            }
+            llama_ggsd_cache_get_stats(ctx_tgt, session.c_str(), &metrics.ggsd_cache);
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -2530,6 +2556,7 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    refresh_ggsd_metrics();
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {

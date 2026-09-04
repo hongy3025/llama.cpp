@@ -2130,3 +2130,26 @@ You can specify default preferences for the web UI using `--ui-config <JSON conf
 > **Note:** The old flags `--webui-config` and `--webui-config-file` are deprecated but still work as aliases.
 
 You may find available preferences in [settings-keys.ts](../ui/src/lib/constants/settings-keys.ts).
+
+### GGSD SSD cache quota
+
+`--prompt-cache-ssd-max-mib N` configures a hard limit for GGSD-managed
+`seg`, `rec`, and temporary-file logical bytes. The default is `0` (unlimited);
+`LLAMA_ARG_PROMPT_CACHE_SSD_MAX_MIB` provides the equivalent environment setting.
+The option requires `--slot-save-path`, but also governs manual incremental
+save/restore endpoints without enabling autosave/autoload. Before an over-limit
+write, synchronous dependency-aware Leaf-LRU collection targets 90% of the
+limit and preserves shared prefixes. Quota rejection only reduces cache
+coverage; inference falls back to prefill. The single-writer, no-background-
+thread contract remains unchanged.
+
+When metrics are enabled, the nine GGSD series are:
+`llamacpp:ggsd_gc_runs_total`,
+`llamacpp:ggsd_gc_deleted_bytes_total`,
+`llamacpp:ggsd_gc_failures_total`,
+`llamacpp:ggsd_cache_writes_rejected_total`,
+`llamacpp:ggsd_cache_touch_failures_total`,
+`llamacpp:ggsd_cache_bytes`,
+`llamacpp:ggsd_cache_limit_bytes`,
+`llamacpp:ggsd_cache_segments`, and
+`llamacpp:ggsd_cache_rec_snapshots`.

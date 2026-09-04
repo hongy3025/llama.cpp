@@ -676,6 +676,7 @@ struct common_params {
     bool prompt_cache_ssd        = false; // enable GGSD autoload + autosave (requires --slot-save-path)
     int32_t prompt_cache_ssd_min_prefix = 1024;  // min reusable prefix tokens to trigger GGSD autoload/autosave
     int32_t prompt_cache_ssd_margin     = 256;   // GGSD must beat the runner-up by this much
+    uint64_t prompt_cache_ssd_max_mib = 0; // hard GGSD managed-byte limit; zero is unlimited
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

@@ -1,3 +1,4 @@
+#include "llama-ggsd-cache.h"
 #include "llama.h"
 
 #include "llama-arch.h"
@@ -368,7 +369,7 @@ namespace {
 
     // write one aligned segment file (.tmp + rename), shared by the standard
     // and hybrid save paths
-    void ggsd_write_segment(
+    bool ggsd_write_segment(
             llama_kv_cache * kv,
             const std::string & session_path,
             llama_seq_id seq_id,
@@ -379,56 +380,73 @@ namespace {
             const llama_token * tokens,
             llama_pos pos_begin,
             llama_pos pos_end,
-            size_t & n_written) {
-        // measure the payload size
+            size_t & n_written,
+            llama_ggsd::cache * cache,
+            llama_ggsd::cache_reservation * group_reservation = nullptr) {
         ggsd_io_write_dummy io_dummy;
         kv->state_write_range(io_dummy, seq_id, pos_begin, pos_end);
         const uint64_t payload_size = io_dummy.n_bytes();
-
+        uint64_t file_size = 0;
+        if (cache && !llama_ggsd::segment_serialized_size(model_id.size(), kv_params.size(), payload_size, file_size)) {
+            return false;
+        }
         const std::string fname = ggsd_segment_path(session_path, hashes[k]);
         const std::string fname_tmp = fname + ".tmp";
-        ggsd_ensure_parent_dir(fname);
-        {
-            llama_file file(fname_tmp.c_str(), "wb");
-
-            file.write_raw(GGSD_MAGIC, sizeof(GGSD_MAGIC));
-            file.write_u32(GGSD_VERSION);
-            file.write_u32((uint32_t) k);
-
-            char prev[GGSD_HASH_HEX_LEN];
-            if (k == 0) {
-                memset(prev, 0, sizeof(prev));
-            } else {
-                memcpy(prev, hashes[k - 1].c_str(), sizeof(prev));
-            }
-            file.write_raw(prev, sizeof(prev));
-
-            file.write_u32(GGSD_SEGMENT_TOKENS);
-            file.write_raw(&payload_size, sizeof(payload_size));
-
-            uint8_t digest[32]; // full sha256; the header stores the first GGSD_HASH_BYTES
-            memset(digest, 0, sizeof(digest));
-            file.write_raw(digest, GGSD_HASH_BYTES); // patched below
-
-            ggsd_write_str(file, model_id);
-            ggsd_write_str(file, kv_params);
-            file.write_raw(tokens + k * GGSD_SEGMENT_TOKENS, GGSD_SEGMENT_TOKENS * sizeof(llama_token));
-
-            llama_sha256_t sha;
-            llama_sha256_init(&sha);
-            {
-                ggsd_io_write_file io(&file, &sha);
-                kv->state_write_range(io, seq_id, pos_begin, pos_end);
-            }
-            llama_sha256_final(&sha, digest);
-
-            // patch the truncated payload hash into the header
-            file.seek(GGSD_HEADER_PAYLOAD_HASH_OFFSET, SEEK_SET);
-            file.write_raw(digest, GGSD_HASH_BYTES);
+        std::optional<llama_ggsd::cache_reservation> reservation;
+        if (group_reservation) {
+            if (group_reservation->remaining() < file_size) return false;
+        } else if (cache) {
+            std::vector<llama_ggsd::object_id> protect;
+            if (k > 0) protect.push_back({llama_ggsd::object_kind::segment, hashes[k - 1]});
+            reservation = cache->reserve(file_size, protect);
+            if (!reservation) return false;
         }
-
-        std::filesystem::rename(fname_tmp, fname);
-        ++n_written;
+        try {
+            ggsd_ensure_parent_dir(fname);
+            {
+                llama_file file(fname_tmp.c_str(), "wb");
+                file.write_raw(GGSD_MAGIC, sizeof(GGSD_MAGIC));
+                file.write_u32(GGSD_VERSION);
+                file.write_u32((uint32_t) k);
+                char prev[GGSD_HASH_HEX_LEN];
+                if (k == 0) memset(prev, 0, sizeof(prev));
+                else memcpy(prev, hashes[k - 1].c_str(), sizeof(prev));
+                file.write_raw(prev, sizeof(prev));
+                file.write_u32(GGSD_SEGMENT_TOKENS);
+                file.write_raw(&payload_size, sizeof(payload_size));
+                uint8_t digest[32] = {};
+                file.write_raw(digest, GGSD_HASH_BYTES);
+                ggsd_write_str(file, model_id);
+                ggsd_write_str(file, kv_params);
+                file.write_raw(tokens + k * GGSD_SEGMENT_TOKENS, GGSD_SEGMENT_TOKENS * sizeof(llama_token));
+                llama_sha256_t sha; llama_sha256_init(&sha);
+                { ggsd_io_write_file io(&file, &sha); kv->state_write_range(io, seq_id, pos_begin, pos_end); }
+                llama_sha256_final(&sha, digest);
+                file.seek(GGSD_HEADER_PAYLOAD_HASH_OFFSET, SEEK_SET);
+                file.write_raw(digest, GGSD_HASH_BYTES);
+            }
+            if (group_reservation) {
+                std::string error;
+                if (!group_reservation->finalize_temporary(llama_ggsd::object_kind::segment, fname_tmp, fname, file_size, error)) {
+                    group_reservation->abandon_temporary(fname_tmp, file_size);
+                    return false;
+                }
+            } else if (reservation) {
+                std::string error;
+                if (!reservation->finalize_temporary(llama_ggsd::object_kind::segment, fname_tmp, fname, file_size, error)) {
+                    reservation->abandon_temporary(fname_tmp, file_size);
+                    return false;
+                }
+            } else {
+                std::filesystem::rename(fname_tmp, fname);
+            }
+            ++n_written;
+            return true;
+        } catch (...) {
+            if (group_reservation) group_reservation->abandon_temporary(fname_tmp, file_size);
+            else if (reservation) reservation->abandon_temporary(fname_tmp, file_size);
+            throw;
+        }
     }
 
     // read, verify and replay one aligned segment file; returns false when the
@@ -609,7 +627,8 @@ size_t llama_context::state_seq_save_incr(
             continue;
         }
 
-        ggsd_write_segment(kv, session_path, seq_id, k, hashes, model_id, kv_params, tokens, pos_begin, pos_end, n_written);
+        if (!ggsd_write_segment(kv, session_path, seq_id, k, hashes, model_id, kv_params, tokens, pos_begin, pos_end, n_written,
+                ggsd_cache_for_session(session_path))) break;
     }
 
     // final chain length: the longest prefix of the hash chain present on disk.
@@ -643,6 +662,9 @@ size_t llama_context::state_seq_save_incr(
         file.write_u32((uint32_t) n_chain);
     }
 
+    if (auto * cache = ggsd_cache_for_session(session_path)) {
+        cache->touch({llama_ggsd::object_kind::segment, hashes[n_chain - 1]});
+    }
     return n_chain;
 }
 
@@ -666,7 +688,6 @@ size_t llama_context::state_seq_save_incr_hybrid(
 
     const std::string model_id  = llm_arch_name(model.arch);
     const std::string kv_params = ggsd_kv_params(model, kv_attn);
-
     const size_t n_seg = n_token_count / GGSD_SEGMENT_TOKENS;
 
     // hash chain of aligned blocks (same identity as the standard path)
@@ -677,6 +698,57 @@ size_t llama_context::state_seq_save_incr_hybrid(
                 __func__, (int) kv_attn->seq_pos_min(seq_id));
         return (size_t) -1;
     }
+    auto * cache = ggsd_cache_for_session(session_path);
+    const bool target_rec_exists = std::filesystem::exists(
+            ggsd_rec_path(session_path, ggsd_prefix_hash(model_id, kv_params, tokens, n_token_count)));
+    std::optional<llama_ggsd::cache_reservation> group_reservation;
+    if (cache) {
+        size_t existing = 0;
+        while (existing < n_seg && std::filesystem::exists(ggsd_segment_path(session_path, hashes[existing]))) {
+            ++existing;
+        }
+        bool measurable = true;
+        uint64_t group_size = 0;
+        for (size_t k = existing; k < n_seg; ++k) {
+            const llama_pos begin = (llama_pos) (k * GGSD_SEGMENT_TOKENS);
+            const llama_pos end = (llama_pos) ((k + 1) * GGSD_SEGMENT_TOKENS);
+            if (kv_attn->count_cells_range(seq_id, begin, end) != GGSD_SEGMENT_TOKENS) {
+                measurable = false;
+                break;
+            }
+            ggsd_io_write_dummy io;
+            kv_attn->state_write_range(io, seq_id, begin, end);
+            uint64_t size = 0;
+            if (!llama_ggsd::segment_serialized_size(model_id.size(), kv_params.size(), io.n_bytes(), size) ||
+                    group_size > UINT64_MAX - size) {
+                measurable = false;
+                break;
+            }
+            group_size += size;
+        }
+        if (measurable && !target_rec_exists) {
+            const size_t tail = n_token_count - n_seg * GGSD_SEGMENT_TOKENS;
+            ggsd_io_write_dummy io;
+            if (tail > 0) {
+                kv_attn->state_write_range(io, seq_id, (llama_pos) (n_seg * GGSD_SEGMENT_TOKENS), (llama_pos) n_token_count);
+            }
+            mem_recr->state_write(io, seq_id);
+            uint64_t rec_size = 0;
+            if (!llama_ggsd::rec_serialized_size(model_id.size(), kv_params.size(), n_token_count, io.n_bytes(), rec_size) ||
+                    group_size > UINT64_MAX - rec_size) {
+                measurable = false;
+            } else {
+                group_size += rec_size;
+            }
+        }
+        if (measurable) {
+            std::vector<llama_ggsd::object_id> protect;
+            if (existing > 0) protect.push_back({llama_ggsd::object_kind::segment, hashes[existing - 1]});
+            group_reservation = cache->reserve(group_size, protect);
+        }
+    }
+
+
 
     // aligned segments: same write loop as the standard path
     size_t n_written = 0;
@@ -693,7 +765,8 @@ size_t llama_context::state_seq_save_incr_hybrid(
             break;
         }
 
-        ggsd_write_segment(kv_attn, session_path, seq_id, k, hashes, model_id, kv_params, tokens, pos_begin, pos_end, n_written);
+        if (!ggsd_write_segment(kv_attn, session_path, seq_id, k, hashes, model_id, kv_params, tokens, pos_begin, pos_end, n_written,
+                cache, group_reservation ? &*group_reservation : nullptr)) break;
     }
 
     // longest on-disk chain prefix
@@ -729,47 +802,66 @@ size_t llama_context::state_seq_save_incr_hybrid(
                 }
                 mem_recr->state_write(io_dummy, seq_id);
                 const uint64_t payload_size = io_dummy.n_bytes();
-
-                const std::string fname_tmp = fname + ".tmp";
-                ggsd_ensure_parent_dir(fname);
-                {
-                    llama_file file(fname_tmp.c_str(), "wb");
-
-                    file.write_raw(GGSD_REC_MAGIC, sizeof(GGSD_REC_MAGIC));
-                    file.write_u32(GGSD_VERSION);
-                    file.write_u32((uint32_t) n_token_count);
-                    file.write_u32((uint32_t) n_tail);
-                    file.write_raw(chain_hash.c_str(), GGSD_HASH_HEX_LEN);
-                    file.write_raw(&payload_size, sizeof(payload_size));
-
-                    uint8_t digest[32];
-                    memset(digest, 0, sizeof(digest));
-                    file.write_raw(digest, GGSD_HASH_BYTES); // patched below
-
-                    ggsd_write_str(file, model_id);
-                    ggsd_write_str(file, kv_params);
-                    file.write_raw(tokens, n_token_count * sizeof(llama_token));
-
-                    llama_sha256_t sha;
-                    llama_sha256_init(&sha);
-                    {
-                        ggsd_io_write_file io(&file, &sha);
-                        if (n_tail > 0) {
-                            kv_attn->state_write_range(io, seq_id, tail_begin, tail_end);
-                        }
-                        mem_recr->state_write(io, seq_id);
-                    }
-                    llama_sha256_final(&sha, digest);
-
-                    // patch the payload hash into the header
-                    file.seek(GGSD_REC_HEADER_PAYLOAD_HASH_OFFSET, SEEK_SET);
-                    file.write_raw(digest, GGSD_HASH_BYTES);
+                uint64_t file_size = 0;
+                if (cache && !llama_ggsd::rec_serialized_size(model_id.size(), kv_params.size(), n_token_count, payload_size, file_size)) {
+                    return (size_t) -1;
                 }
-                std::filesystem::rename(fname_tmp, fname);
-            }
+                std::optional<llama_ggsd::cache_reservation> reservation;
+                if (group_reservation) {
+                    if (group_reservation->remaining() < file_size) return n_chain;
+                } else if (cache) {
+                    reservation = cache->reserve(file_size, {});
+                    if (!reservation) return n_chain;
+                }
+                const std::string fname_tmp = fname + ".tmp";
+                try {
+                    ggsd_ensure_parent_dir(fname);
+                    {
+                        llama_file file(fname_tmp.c_str(), "wb");
+                        file.write_raw(GGSD_REC_MAGIC, sizeof(GGSD_REC_MAGIC));
+                        file.write_u32(GGSD_VERSION);
+                        file.write_u32((uint32_t) n_token_count);
+                        file.write_u32((uint32_t) n_tail);
+                        file.write_raw(chain_hash.c_str(), GGSD_HASH_HEX_LEN);
+                        file.write_raw(&payload_size, sizeof(payload_size));
+                        uint8_t digest[32] = {};
+                        file.write_raw(digest, GGSD_HASH_BYTES);
+                        ggsd_write_str(file, model_id);
+                        ggsd_write_str(file, kv_params);
+                        file.write_raw(tokens, n_token_count * sizeof(llama_token));
+                        llama_sha256_t sha;
+                        llama_sha256_init(&sha);
+                        {
+                            ggsd_io_write_file io(&file, &sha);
+                            if (n_tail > 0) kv_attn->state_write_range(io, seq_id, tail_begin, tail_end);
+                            mem_recr->state_write(io, seq_id);
+                        }
+                        llama_sha256_final(&sha, digest);
+                        file.seek(GGSD_REC_HEADER_PAYLOAD_HASH_OFFSET, SEEK_SET);
+                        file.write_raw(digest, GGSD_HASH_BYTES);
+                    }
+                    if (group_reservation) {
+                        std::string error;
+                        if (!group_reservation->finalize_temporary(llama_ggsd::object_kind::rec, fname_tmp, fname, file_size, error)) {
+                            group_reservation->abandon_temporary(fname_tmp, file_size);
+                            return (size_t) -1;
+                        }
+                    } else if (reservation) {
+                        std::string error;
+                        if (!reservation->finalize_temporary(llama_ggsd::object_kind::rec, fname_tmp, fname, file_size, error)) {
+                            reservation->abandon_temporary(fname_tmp, file_size);
+                            return (size_t) -1;
+                        }
+                    } else std::filesystem::rename(fname_tmp, fname);
+                } catch (...) {
+                    if (group_reservation) group_reservation->abandon_temporary(fname_tmp, file_size);
+                    else if (reservation) reservation->abandon_temporary(fname_tmp, file_size);
+                    throw;
+                }
         }
     }
 
+    }
     if (n_seg > 0 && n_chain == 0) {
         LLAMA_LOG_ERROR("%s: attn cache is missing the head of the sequence, nothing usable saved\n", __func__);
         return (size_t) -1;
@@ -778,6 +870,9 @@ size_t llama_context::state_seq_save_incr_hybrid(
     LLAMA_LOG_INFO("%s: wrote %zu segment(s), rec coverage %zu tokens (chain %zu)\n",
             __func__, n_written, n_token_count, n_chain);
 
+    if (auto * cache = ggsd_cache_for_session(session_path)) {
+        cache->touch({llama_ggsd::object_kind::rec, ggsd_prefix_hash(model_id, kv_params, tokens, n_token_count)});
+    }
     return n_chain;
 }
 
@@ -873,7 +968,13 @@ size_t llama_context::state_seq_load_incr(
     // the failure are kept - the return value always matches the cache state
     // (review M1). Only an exception (IO failure) unwinds via the catch above.
 
-    return (n_loaded + k0) * GGSD_SEGMENT_TOKENS;
+    const size_t restored = (n_loaded + k0) * GGSD_SEGMENT_TOKENS;
+    if (restored >= min_prefix_tokens && restored > 0) {
+        if (auto * cache = ggsd_cache_for_session(session_path)) {
+            cache->touch({llama_ggsd::object_kind::segment, hashes[(n_loaded + k0) - 1]});
+        }
+    }
+    return restored;
 }
 
 size_t llama_context::state_seq_load_incr_hybrid(
@@ -1009,6 +1110,9 @@ size_t llama_context::state_seq_load_incr_hybrid(
     LLAMA_LOG_INFO("%s: restored %zu tokens (%zu segments + %u tail tokens + rec state)\n",
             __func__, best_tokens, n_loaded, best_h.n_tail);
 
+    if (auto * cache = ggsd_cache_for_session(session_path)) {
+        cache->touch({llama_ggsd::object_kind::rec, best_path.filename().string()});
+    }
     return best_tokens;
 }
 
@@ -1150,4 +1254,54 @@ size_t llama_state_seq_load_incr(
         LLAMA_LOG_ERROR("%s: error loading incremental sequence state: %s\n", __func__, err.what());
         return 0;
     }
+}
+
+llama_ggsd_cache_params llama_ggsd_cache_default_params() {
+    return { 0 };
+}
+
+bool llama_context::ggsd_cache_configure(const char * session_path, llama_ggsd_cache_params params) {
+    if (!session_path) return false;
+    std::error_code ec;
+    const auto pool = std::filesystem::weakly_canonical(std::filesystem::path(session_path).parent_path(), ec);
+    if (ec || !std::filesystem::is_directory(std::filesystem::symlink_status(pool, ec)) || ec) return false;
+    const auto key = pool.string();
+    if (params.max_bytes == 0) {
+        ggsd_caches.erase(key);
+        return true;
+    }
+    std::string error;
+    auto state = llama_ggsd::cache::open(pool, params.max_bytes, llama_ggsd::cache_file_ops::system(), error);
+    if (!state) {
+        LLAMA_LOG_ERROR("%s: failed to configure GGSD cache: %s\n", __func__, error.c_str());
+        return false;
+    }
+    ggsd_caches[key] = std::move(state);
+    return true;
+}
+
+llama_ggsd::cache * llama_context::ggsd_cache_for_session(const char * session_path) {
+    if (!session_path) return nullptr;
+    std::error_code ec;
+    const auto pool = std::filesystem::weakly_canonical(std::filesystem::path(session_path).parent_path(), ec);
+    if (ec) return nullptr;
+    const auto it = ggsd_caches.find(pool.string());
+    return it == ggsd_caches.end() ? nullptr : it->second.get();
+}
+
+bool llama_context::ggsd_cache_get_stats(const char * session_path, llama_ggsd_cache_stats & out) const {
+    auto * self = const_cast<llama_context *>(this);
+    auto * c = self->ggsd_cache_for_session(session_path);
+    if (!c) return false;
+    const auto & s = c->stats();
+    out = {s.bytes,s.limit_bytes,s.segments,s.rec_snapshots,s.gc_runs,s.gc_deleted_bytes,s.gc_failures,s.writes_rejected,s.touch_failures};
+    return true;
+}
+
+bool llama_ggsd_cache_configure(llama_context * ctx, const char * path, llama_ggsd_cache_params params) {
+    try { return ctx && ctx->ggsd_cache_configure(path, params); } catch (...) { return false; }
+}
+
+bool llama_ggsd_cache_get_stats(const llama_context * ctx, const char * path, llama_ggsd_cache_stats * stats) {
+    try { return ctx && stats && ctx->ggsd_cache_get_stats(path, *stats); } catch (...) { return false; }
 }

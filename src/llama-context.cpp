@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#include "llama-ggsd-cache.h"
 
 #include <cinttypes>
 #include <cmath>

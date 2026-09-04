@@ -893,6 +893,27 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+    // GGSD managed-cache quota. A zero limit preserves unlimited behavior.
+    struct llama_ggsd_cache_params {
+        uint64_t max_bytes;
+    };
+
+    struct llama_ggsd_cache_stats {
+        uint64_t bytes;
+        uint64_t limit_bytes;
+        uint64_t segments;
+        uint64_t rec_snapshots;
+        uint64_t gc_runs;
+        uint64_t gc_deleted_bytes;
+        uint64_t gc_failures;
+        uint64_t writes_rejected;
+        uint64_t touch_failures;
+    };
+
+    LLAMA_API struct llama_ggsd_cache_params llama_ggsd_cache_default_params(void);
+    LLAMA_API bool llama_ggsd_cache_configure(struct llama_context * ctx, const char * session_path, struct llama_ggsd_cache_params params);
+    LLAMA_API bool llama_ggsd_cache_get_stats(const struct llama_context * ctx, const char * session_path, struct llama_ggsd_cache_stats * stats);
+
     // GGSD - incremental sequence state save/load
     //
     // Save the KV state of a sequence as a chain of 1024-token segments,

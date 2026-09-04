@@ -201,9 +201,8 @@ GGSD 按 KV memory 的具体类型分派:
 
 匹配规则:请求必须**精确延长**某个已保存的 rec 快照 - recurrent 状态钉死在快照时的确切 token 前缀上,无法从段里重建。恢复覆盖量 = rec 文件的 `n_tokens`(可以不是 1024 的倍数);段文件只提供注意力 KV 的字节,从不单独扩大覆盖。服务端除保存 completion 结束状态外,还在用户消息边界保存公共前缀,使不同新对话能复用相同的 system/tools 前缀。
 
-清理:rec 文件按内容寻址并保留所有存盘点。父快照不能由子快照替代,因为兄弟分支只匹配父快照。rec 与段池均无自动 GC,由使用者停服后手动清理。
-
-磁盘代价:每份会话状态 = recurrent 状态(固定,几 MB)+ 注意力尾部(最多 1023 token);公共前缀只存一份。SWA 混合(hybrid-iswa)仍被拒绝,`--swa-full` 与本节无关。
+- **Quota 与 GC**: `--prompt-cache-ssd-max-mib N`（默认 `0`，也可用 `LLAMA_ARG_PROMPT_CACHE_SSD_MAX_MIB`）限制识别的 `seg`、`rec` 与临时文件逻辑字节，不包含整个保存目录或文件系统分配开销。超限写入前同步执行依赖感知的 Leaf-LRU，回收到固定 90% 低水位；共享前缀保持闭合，手动与自动保存使用相同策略。成功标准恢复更新最深段，成功 hybrid 恢复更新所选 rec，更新每十分钟限一次。配额拒绝只减少缓存覆盖，推理回退到 prefill；正值即使未启用 autosave/autoload 也作用于手动端点。仍保持单写者、无后台线程。
+- **指标**: `llamacpp:ggsd_gc_runs_total`、`llamacpp:ggsd_gc_deleted_bytes_total`、`llamacpp:ggsd_gc_failures_total`、`llamacpp:ggsd_cache_writes_rejected_total`、`llamacpp:ggsd_cache_touch_failures_total`、`llamacpp:ggsd_cache_bytes`、`llamacpp:ggsd_cache_limit_bytes`、`llamacpp:ggsd_cache_segments`、`llamacpp:ggsd_cache_rec_snapshots`。
 
 并发与模式选择语义与 1.6 相同;`--prompt-cache-ssd` 的自动闭环见 `docs/ggsd-autoload-guide.md` 2.8。
 
