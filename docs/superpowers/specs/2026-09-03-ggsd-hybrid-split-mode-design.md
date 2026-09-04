@@ -152,9 +152,9 @@ identity `pos_get(i) == i` still holds for text tokens; sections live in ext).
 
 - Upstream may close the `cell_ext` TODO differently; our fix should stay
   minimal and be easy to rebase.
-- `rec_*.bin` size is dominated by the attn tail (up to 1023 tokens x
-  ~32 KB/token for Qwen3.5-9B ~ 32 MB max per conversation) plus the rec
-  snapshot (fixed, a few MB). Acceptable; only the latest per chain is kept.
+- A rec snapshot's size is dominated by the attn tail (up to 1023 tokens x
+  ~32 KB/token for Qwen3.5-9B ~ 32 MB max per snapshot) plus the rec
+  snapshot (fixed, a few MB). Branch-point snapshots require manual cleanup.
 - The `ext_set` addition must not perturb the non-mrope path (guarded by
   `n_pos_per_embd > 1`).
 
@@ -166,14 +166,8 @@ Deviations from the design text above, settled during implementation review:
   reserved `codec` field. Fields: magic, version, u32 `n_tokens`, u32
   `n_tail`, u8[32] `chain_hash`, u64 `payload_size`, u8[16] truncated
   `payload_hash`, model_id, kv_params, token array.
-- Dominated-parent cleanup deletes **all** strictly dominated rec files
-  (a candidate whose stored token array is a strict prefix of the freshly
-  saved sequence, same model identity - compared via the token array, not
-  via `prev_chain_hash`), not only the direct parent. This achieves
-  one-rec-per-chain even when intermediate states were saved at
-  non-contiguous lengths. The cleanup runs only when the child rec file
-  exists (written now or already on disk), so a skipped child write never
-  deletes the surviving parent.
+- The initial implementation deleted strictly dominated rec files. Amendment 3
+  supersedes that behavior because parent snapshots are required by siblings.
 - Estimate verifies segment availability with the same coverage rule as load:
   a candidate is priced when the segments under its own tail all exist for the
   request, i.e. `n_tail < 1024`, `(n_tokens - n_tail)` is a multiple of 1024,
@@ -183,3 +177,26 @@ Deviations from the design text above, settled during implementation review:
   chain length). Load replays only the rec's own chain segments, then appends
   the tail, so a longer on-disk chain is never overwritten by the tail. Estimate
   reads headers only (no token array).
+
+## Amendment 2 (2026-09-04, sharded pool layout)
+
+`seg_`/`rec_` flat files in the save directory are replaced by a sharded,
+extensionless layout: `<pool>/seg/<hh>/<hash>` and `<pool>/rec/<hh>/<hash>`,
+where `<hh>` is the first two hex chars of the 32-char content hash (256
+shards). The session hint file `session_<name>.bin` stays in the pool root.
+File contents and hashes are unchanged - only placement. Writers create the
+shard directory before the tmp write; readers list shard dirs instead of
+pattern-matching names, so a flat legacy directory is simply an empty pool
+(graceful miss, no crash). Existing pools migrate by moving each file to
+its shard path.
+
+## Amendment 3 (2026-09-04, persistent branch points)
+
+The server saves a hybrid rec snapshot at each user-message context checkpoint,
+before that user's tokens are decoded. This preserves the shared system/tools
+prefix needed when a new conversation branches at the user message. Completion
+autosave remains unchanged and preserves continuation across restart.
+
+Dominated-parent cleanup is removed. A child snapshot cannot replace its parent
+for a sibling request because the child's token sequence is not a prefix of the
+sibling. Rec snapshots are content-addressed and retained until manual cleanup.

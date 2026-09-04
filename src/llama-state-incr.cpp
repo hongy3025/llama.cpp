@@ -34,9 +34,50 @@ namespace {
     // segment header size before the payload hash field
     constexpr size_t GGSD_HEADER_PAYLOAD_HASH_OFFSET = 4 + 4 + 4 + 32 + 4 + 8;
 
+    // content-addressed pool layout: <pool>/seg/<hh>/<hash> and <pool>/rec/<hh>/<hash>,
+    // where <hh> is the first two hex chars of the 32-char hash (256 shards)
     std::string ggsd_segment_path(const std::string & session_path, const std::string & hash) {
         std::filesystem::path p(session_path);
-        return (p.parent_path() / ("seg_" + hash + ".bin")).string();
+        return (p.parent_path() / "seg" / hash.substr(0, 2) / hash).string();
+    }
+
+    void ggsd_ensure_parent_dir(const std::string & fname) {
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(fname).parent_path(), ec);
+    }
+
+    // true for <hash> content files: exactly 32 lowercase hex chars
+    bool ggsd_is_hash_name(const std::string & name) {
+        if (name.size() != GGSD_HASH_HEX_LEN) {
+            return false;
+        }
+        for (const char c : name) {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // list content files under pool_dir/<kind>/<shard>/, skipping junk
+    std::vector<std::filesystem::path> ggsd_list_pool_files(const std::filesystem::path & pool_dir, const char * kind) {
+        std::vector<std::filesystem::path> out;
+        std::error_code ec;
+        const std::filesystem::path root = pool_dir / kind;
+        if (!std::filesystem::exists(root, ec)) {
+            return out;
+        }
+        for (const auto & shard : std::filesystem::directory_iterator(root, ec)) {
+            if (!shard.is_directory()) {
+                continue;
+            }
+            for (const auto & entry : std::filesystem::directory_iterator(shard.path(), ec)) {
+                if (entry.is_regular_file() && ggsd_is_hash_name(entry.path().filename().string())) {
+                    out.push_back(entry.path());
+                }
+            }
+        }
+        return out;
     }
 
     void ggsd_hash_hex_to_bytes(const std::string & hex, uint8_t * bytes) {
@@ -280,14 +321,9 @@ namespace {
 
     std::string ggsd_rec_path(const std::string & session_path, const std::string & hash) {
         std::filesystem::path p(session_path);
-        return (p.parent_path() / ("rec_" + hash + ".bin")).string();
+        return (p.parent_path() / "rec" / hash.substr(0, 2) / hash).string();
     }
 
-    // true for rec_<hash>.bin cache files (exact suffix, not a substring hit)
-    bool ggsd_is_rec_name(const std::string & name) {
-        return name.rfind("rec_", 0) == 0 && name.size() >= 4 &&
-               name.compare(name.size() - 4, 4, ".bin") == 0;
-    }
 
     // reads magic, version, n_tokens, n_tail, chain_hash, payload_size, payload_hash,
     // model_id, kv_params; the token array is read only when read_tokens is set.
@@ -351,6 +387,7 @@ namespace {
 
         const std::string fname = ggsd_segment_path(session_path, hashes[k]);
         const std::string fname_tmp = fname + ".tmp";
+        ggsd_ensure_parent_dir(fname);
         {
             llama_file file(fname_tmp.c_str(), "wb");
 
@@ -676,9 +713,9 @@ size_t llama_context::state_seq_save_incr_hybrid(
     {
         const std::string chain_hash = ggsd_prefix_hash(model_id, kv_params, tokens, n_token_count);
         const std::string fname = ggsd_rec_path(session_path, chain_hash);
-        bool rec_written = std::filesystem::exists(fname);
+        const bool rec_exists = std::filesystem::exists(fname);
 
-        if (!rec_written) {
+        if (!rec_exists) {
             const llama_pos tail_begin = (llama_pos) (n_chain * GGSD_SEGMENT_TOKENS);
             const llama_pos tail_end   = (llama_pos) n_token_count;
 
@@ -694,6 +731,7 @@ size_t llama_context::state_seq_save_incr_hybrid(
                 const uint64_t payload_size = io_dummy.n_bytes();
 
                 const std::string fname_tmp = fname + ".tmp";
+                ggsd_ensure_parent_dir(fname);
                 {
                     llama_file file(fname_tmp.c_str(), "wb");
 
@@ -728,41 +766,6 @@ size_t llama_context::state_seq_save_incr_hybrid(
                     file.write_raw(digest, GGSD_HASH_BYTES);
                 }
                 std::filesystem::rename(fname_tmp, fname);
-                rec_written = true;
-            }
-        }
-
-        // dominated-parent cleanup: drop rec files whose token sequence is a
-        // strict prefix of the one just saved; gated on rec_written so the last
-        // surviving copy of the chain is never deleted when our own write failed
-        std::filesystem::path rec_dir = std::filesystem::path(session_path).parent_path();
-        if (rec_dir.empty()) {
-            rec_dir = ".";
-        }
-        if (rec_written && std::filesystem::exists(rec_dir)) {
-            for (const auto & entry : std::filesystem::directory_iterator(rec_dir)) {
-                const std::string name = entry.path().filename().string();
-                if (!ggsd_is_rec_name(name) || entry.path() == std::filesystem::path(fname)) {
-                    continue;
-                }
-                try {
-                    llama_file f(entry.path().string().c_str(), "rb");
-                    ggsd_rec_header h;
-                    if (!ggsd_rec_read_header(f, h)) {
-                        continue;
-                    }
-                    if (h.model_id != model_id || h.kv_params != kv_params) {
-                        continue;
-                    }
-                    if (h.n_tokens < n_token_count &&
-                            memcmp(h.tokens.data(), tokens, h.n_tokens * sizeof(llama_token)) == 0) {
-                        std::filesystem::remove(entry.path());
-                        LLAMA_LOG_INFO("%s: removed dominated rec file %s (%u tokens)\n",
-                                __func__, name.c_str(), h.n_tokens);
-                    }
-                } catch (...) {
-                    // unreadable file: leave it alone
-                }
             }
         }
     }
@@ -909,20 +912,10 @@ size_t llama_context::state_seq_load_incr_hybrid(
     ggsd_rec_header best_h;
     size_t n_chain_best = 0;
 
-    std::filesystem::path rec_dir = std::filesystem::path(session_path).parent_path();
-    if (rec_dir.empty()) {
-        rec_dir = ".";
-    }
-    if (!std::filesystem::exists(rec_dir)) {
-        return 0;
-    }
-    for (const auto & entry : std::filesystem::directory_iterator(rec_dir)) {
-        const std::string name = entry.path().filename().string();
-        if (!ggsd_is_rec_name(name)) {
-            continue;
-        }
+    const std::filesystem::path pool_dir = std::filesystem::path(session_path).parent_path();
+    for (const auto & path : ggsd_list_pool_files(pool_dir, "rec")) {
         try {
-            llama_file f(entry.path().string().c_str(), "rb");
+            llama_file f(path.string().c_str(), "rb");
             ggsd_rec_header h;
             if (!ggsd_rec_read_header(f, h)) {
                 continue;
@@ -947,7 +940,7 @@ size_t llama_context::state_seq_load_incr_hybrid(
                 continue;
             }
             best_tokens   = h.n_tokens;
-            best_path     = entry.path();
+            best_path     = path;
             best_h        = std::move(h);
             n_chain_best  = n_chain_rec;
         } catch (...) {
@@ -1084,20 +1077,10 @@ size_t llama_context::state_seq_estimate_hybrid(
 
     size_t best_tokens = 0;
 
-    std::filesystem::path rec_dir = std::filesystem::path(session_path).parent_path();
-    if (rec_dir.empty()) {
-        rec_dir = ".";
-    }
-    if (!std::filesystem::exists(rec_dir)) {
-        return 0;
-    }
-    for (const auto & entry : std::filesystem::directory_iterator(rec_dir)) {
-        const std::string name = entry.path().filename().string();
-        if (!ggsd_is_rec_name(name)) {
-            continue;
-        }
+    const std::filesystem::path pool_dir = std::filesystem::path(session_path).parent_path();
+    for (const auto & path : ggsd_list_pool_files(pool_dir, "rec")) {
         try {
-            llama_file f(entry.path().string().c_str(), "rb");
+            llama_file f(path.string().c_str(), "rb");
             ggsd_rec_header h;
             if (!ggsd_rec_read_header(f, h, /* read_tokens = */ false)) {
                 continue;

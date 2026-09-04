@@ -39,10 +39,12 @@ GGSD 的所有产物都在这一个目录里:
 
 ```
 saves/
-  seg_<hash>.bin          # 每 1024 token 一个 KV 段(hybrid 模型下只覆盖注意力层,见 1.7)
-  rec_<hash>.bin          # 仅 hybrid 模型:每份保存的会话状态一个文件(见 1.7)
+  seg/<hh>/<hash>         # 每 1024 token 一个 KV 段(hybrid 模型下只覆盖注意力层,见 1.7)
+  rec/<hh>/<hash>         # 仅 hybrid 模型:每份保存的会话状态一个文件(见 1.7)
   session_<name>.bin      # 极小的保存侧提示文件(链尾哈希,44 字节)
 ```
+
+`<hh>` 是哈希的前 2 个十六进制字符(256 个分片目录),文件名是完整的 32 字符哈希,无扩展名。段与状态各自放在 `seg/`、`rec/` 子池下,避免与 `session_*.bin` 及用户文件混在一层。
 
 ### 1.3 HTTP API
 
@@ -82,7 +84,7 @@ POST /slots/{id_slot}?action=restore_incr
   "n_tokens_restored": 1024, "t_ms": 65.5 }
 ```
 
-- `prompt` 按纯文本分词。其哈希链与保存目录中的 `seg_<hash>.bin` 文件进行匹配;`filename` 仅用于定位目录 - session 文件本身永远不会被读取。
+- `prompt` 按纯文本分词。其哈希链与段池中的 `seg/<hh>/<hash>` 文件进行匹配;`filename` 仅用于定位目录 - session 文件本身永远不会被读取。
 - 恢复的 token 数向下对齐到 1024(segment 模式)。hybrid split 模式的覆盖量是 rec 文件的 `n_tokens`,不对齐,见 1.7。槽位的 prompt 被置为已恢复前缀,下一次 `/completion` 从这里继续;只有前缀之后的 token 需要重新 prefill。
 - `min_prefix`(可选,默认 64)是最小恢复长度。匹配不足时不恢复任何内容,返回 `n_tokens_restored: 0`,prompt 走完整 prefill。把 `min_prefix` 设得高于预期匹配长度,即可表达"值得恢复才恢复"。
 
@@ -154,7 +156,7 @@ n_layer x n_embd_kv x 2 (K 与 V) x sizeof(type_k/v) x n_streams
 
 session 文件每个固定 44 字节。
 
-**增长与清理。** 段是内容寻址且共享的:分叉与改写(例如上下文回滚后继续生成)会创建*新*段并保留旧段,因此目录单调增长。**没有自动垃圾回收** - 孤儿段(没有任何 session 指向的链)需要手动删除。安全做法:先停服务,再删掉不再需要恢复的 `seg_*.bin`;即使删错了段,一切也只是优雅降级(恢复回退到更短前缀,或完整 prefill)。
+**增长与清理。** 段是内容寻址且共享的:分叉与改写(例如上下文回滚后继续生成)会创建*新*段并保留旧段,因此目录单调增长。**没有自动垃圾回收** - 孤儿段(没有任何 session 指向的链)需要手动删除。安全做法:先停服务,再删掉不再需要恢复的 `seg/<hh>/<hash>` 文件;即使删错了段,一切也只是优雅降级(恢复回退到更短前缀,或完整 prefill)。
 
 ### 1.6 语义、限制与错误行为
 
@@ -194,12 +196,12 @@ GGSD 按 KV memory 的具体类型分派:
 
 混合模型的每层状态分两类:注意力层的 KV 可按 token 位置切片;recurrent(线性注意力)层是一个不可切片的运行态摘要。split 模式据此把状态拆成两种文件:
 
-- **`seg_<hash>.bin`(共享段)**:只覆盖注意力层的对齐 1024-token KV,格式与哈希链同上(2.1/2.2)。分叉对话在磁盘上共享公共前缀段,与标准模式一样。
-- **`rec_<chain_hash>.bin`(每份保存的会话状态一个)**:非对齐的注意力层尾部(0 至 1023 个 token)加整个 recurrent 状态快照,附完整 token 列表与头部校验。
+- **`seg/<hh>/<hash>`(共享段)**:只覆盖注意力层的对齐 1024-token KV,格式与哈希链同上(2.1/2.2)。分叉对话在磁盘上共享公共前缀段,与标准模式一样。
+- **`rec/<hh>/<hash>`(每份保存的会话状态一个)**:非对齐的注意力层尾部(0 至 1023 个 token)加整个 recurrent 状态快照,附完整 token 列表与头部校验。
 
-匹配规则:请求必须**精确延长**某条已保存的对话 - recurrent 状态钉死在快照时的确切 token 前缀上,无法从段里重建。恢复覆盖量 = rec 文件的 `n_tokens`(可以不是 1024 的倍数);段文件只提供注意力 KV 的字节,从不单独扩大覆盖。
+匹配规则:请求必须**精确延长**某个已保存的 rec 快照 - recurrent 状态钉死在快照时的确切 token 前缀上,无法从段里重建。恢复覆盖量 = rec 文件的 `n_tokens`(可以不是 1024 的倍数);段文件只提供注意力 KV 的字节,从不单独扩大覆盖。服务端除保存 completion 结束状态外,还在用户消息边界保存公共前缀,使不同新对话能复用相同的 system/tools 前缀。
 
-清理:写入新的 rec 文件时,删除 token 序列是其**严格前缀**的旧 rec 文件 - 旧状态能匹配的请求新状态都能匹配且覆盖更长,删除无损;每条链只保留最新状态。段池策略不变:无自动 GC,孤儿段手动删。
+清理:rec 文件按内容寻址并保留所有存盘点。父快照不能由子快照替代,因为兄弟分支只匹配父快照。rec 与段池均无自动 GC,由使用者停服后手动清理。
 
 磁盘代价:每份会话状态 = recurrent 状态(固定,几 MB)+ 注意力尾部(最多 1023 token);公共前缀只存一份。SWA 混合(hybrid-iswa)仍被拒绝,`--swa-full` 与本节无关。
 
@@ -224,7 +226,7 @@ kv_params = "<type_k>|<type_v>|<n_pos_per_embd>|<n_layer>"   # 例如 "f16|f16|1
 关键性质:
 
 - **不可变。** KV payload *不*参与哈希。段文件只写一次、永不修改,因此"文件是否存在"成为可靠的分叉探测信号。
-- **自认证。** 给定 token 列表,任何人都能零磁盘读取地重算整条哈希链。恢复不需要索引、不需要 manifest、也不需要 session 文件:对 prompt 求哈希,检查哪些 `seg_<hash>.bin` 存在即可。这正是跨 session(G2)复用得以免费实现的原因。
+- **自认证。** 给定 token 列表,任何人都能零磁盘读取地重算整条哈希链。恢复不需要索引、不需要 manifest、也不需要 session 文件:对 prompt 求哈希,检查哪些 `seg/<hh>/<hash>` 存在即可。这正是跨 session(G2)复用得以免费实现的原因。
 - **链式绑定。** 每个哈希绑定其前驱,所以一段只在某条特定 token 链的特定位置上有效 - 无法把不同对话的段拼接起来。
 - **配置绑定。** `model_id` 与 `kv_params` 在哈希之内,所以换模型或换 cache 类型恢复时会静默失配,退化为正常的完整 prefill。`kv_params` 现包含 `n_layer`(split 模式要求 attn 子缓存与整模型可区分);此前写下的旧段池哈希全部失配,等同换配置,可直接删除。
 
@@ -248,14 +250,14 @@ payload 是标准的 `llama_kv_cache::state_write` 单元序列化(与 GGSQ v2 �
 
 session 文件是 44 字节的提示(magic、version、链尾哈希、链长),仅供保存侧使用,用于跳过多余重写并记住上次链长。恢复永远不读它。
 
-hybrid split 模式额外使用 `rec_<chain_hash>.bin`(magic `"GGSR"`,version 同上):头部含 `n_tokens`、`n_tail`、32 字符 `chain_hash`、`payload_size`、`payload_hash`、`model_id`、`kv_params` 与完整 token 列表;payload 先写非对齐 attn 尾部(与段相同的区间格式),再写整个 recurrent 状态。`chain_hash` 覆盖 `tokens[0, n_tokens)` 全序列,不是段对齐前缀。
+hybrid split 模式额外使用 `rec/<hh>/<hash>`(magic `"GGSR"`,version 同上):头部含 `n_tokens`、`n_tail`、32 字符 `chain_hash`、`payload_size`、`payload_hash`、`model_id`、`kv_params` 与完整 token 列表;payload 先写非对齐 attn 尾部(与段相同的区间格式),再写整个 recurrent 状态。`chain_hash` 覆盖 `tokens[0, n_tokens)` 全序列,不是段对齐前缀。
 
 ### 2.3 保存流程
 
 1. 分派:`llama_memory_hybrid` 走 split 保存(见 1.7);其余仅接受标准 KV cache,守卫:非 SWA。
 2. 读 session 文件(可选;损坏或缺失就当新链开始)。
 3. 对 `tokens[0 .. n/1024)` 计算哈希链。
-4. **分叉探测只看文件是否存在**(R2):沿链找到第一个 `seg_<hash>.bin` 缺失的哈希。这里有意不查 KV cache - 已持久化的段即使其单元被驱逐也依然有效。
+4. **分叉探测只看文件是否存在**(R2):沿链找到第一个 `seg/<hh>/<hash>` 缺失的哈希。这里有意不查 KV cache - 已持久化的段即使其单元被驱逐也依然有效。
 5. 从分叉点开始写段,只要 `count_cells_range` 显示 cache 仍连续覆盖该区间;遇到第一个空洞即停(部分 KV 尽力而为,绝不缩短链)。已存在的文件直接跳过(内容寻址使重写变得多余,见 2.5)。
 6. 链长从磁盘重新导出(最长的存在前缀)。若为 0 - 头段既不在磁盘也写不出 - 保存失败(R3,唯一的头段缺失规则)。位置守卫(`seq_pos_min == 0`)仅在必须写头段时生效(M2)。
 7. 链长或链尾哈希变化时重写 44 字节的 session 文件。
@@ -266,7 +268,7 @@ hybrid split 模式额外使用 `rec_<chain_hash>.bin`(magic `"GGSR"`,version �
 
 1. 分派:`llama_memory_hybrid` 走 split 恢复(见 1.7);其余仅接受标准 KV cache,守卫:非 SWA。
 2. 计算 prompt 的哈希链(纯算术,零磁盘读取)。
-3. 对每个哈希,从 `session_path` 所在目录打开 `seg_<hash>.bin`(段池语义,R1)。第一个文件缺失即停止。
+3. 对每个哈希,从段池目录打开 `seg/<hh>/<hash>`(段池语义,R1)。第一个文件缺失即停止。
 4. 对每个匹配段:校验头部(magic、version、model_id、kv_params、prev_hash 与链一致),边读边校验 payload 哈希,并通过 `llama_kv_cache::state_read_append` 把 payload 重放进 KV cache(不清空序列、直接追加,使多段可以连续恢复)。
 5. 向下对齐到 1024,再套用 `min_prefix`;低于阈值则返回 0 且 cache 保持原样。链中途损坏时,已验证前缀保持已恢复状态,返回值如实反映该长度(M1:返回值始终与 cache 状态一致)。
 6. 服务端把槽位 prompt 置为已恢复前缀;正常 prompt 处理从 `n_past = n_tokens_restored` 继续。

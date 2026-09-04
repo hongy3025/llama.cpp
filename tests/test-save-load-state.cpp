@@ -108,33 +108,49 @@ static llama_context_params incr_context_params(const struct common_params & par
     return params_ctx;
 }
 
+// seg files live under <dir>/seg/<hh>/<hash> (content-addressed shards)
 static size_t count_segment_files() {
     size_t n = 0;
-    for (const auto & entry : std::filesystem::directory_iterator(k_incr_dir)) {
-        const std::string name = entry.path().filename().string();
-        if (name.rfind("seg_", 0) == 0) {
-            ++n;
+    const std::filesystem::path root = std::filesystem::path(k_incr_dir) / "seg";
+    if (!std::filesystem::exists(root)) {
+        return 0;
+    }
+    for (const auto & shard : std::filesystem::directory_iterator(root)) {
+        if (!shard.is_directory()) {
+            continue;
+        }
+        for (const auto & entry : std::filesystem::directory_iterator(shard.path())) {
+            if (entry.is_regular_file()) {
+                ++n;
+            }
         }
     }
     return n;
 }
 
 static std::string segment_file_by_index(uint32_t idx) {
-    for (const auto & entry : std::filesystem::directory_iterator(k_incr_dir)) {
-        const std::string name = entry.path().filename().string();
-        if (name.rfind("seg_", 0) != 0) {
+    const std::filesystem::path root = std::filesystem::path(k_incr_dir) / "seg";
+    if (!std::filesystem::exists(root)) {
+        return "";
+    }
+    for (const auto & shard : std::filesystem::directory_iterator(root)) {
+        if (!shard.is_directory()) {
             continue;
         }
-
-        std::ifstream f(entry.path(), std::ios::binary);
-        char     magic[4];
-        uint32_t version;
-        uint32_t seg_index;
-        f.read(magic, 4);
-        f.read((char *) &version, sizeof(version));
-        f.read((char *) &seg_index, sizeof(seg_index));
-        if (seg_index == idx) {
-            return entry.path().string();
+        for (const auto & entry : std::filesystem::directory_iterator(shard.path())) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            std::ifstream f(entry.path(), std::ios::binary);
+            char     magic[4];
+            uint32_t version;
+            uint32_t seg_index;
+            f.read(magic, 4);
+            f.read((char *) &version, sizeof(version));
+            f.read((char *) &seg_index, sizeof(seg_index));
+            if (seg_index == idx) {
+                return entry.path().string();
+            }
         }
     }
     return "";
@@ -623,6 +639,49 @@ static bool test_incr_fork(struct llama_model * model, const struct common_param
     return true;
 }
 
+// Test 7b: GGSD saved prefix survives a child save
+// - save a 1500-token prefix, then save a 2000-token child
+// - restore a sibling that diverges after the saved prefix
+static bool test_incr_fork_prefix(struct llama_model * model, const struct common_params & params) {
+    incr_test_cleanup();
+
+    const std::string session = session_path("session_fork_prefix.bin");
+    const llama_tokens prefix = make_random_tokens(model, 1500, 333);
+    const llama_tokens tail_a = make_random_tokens(model, 500, 444);
+    const llama_tokens tail_b = make_random_tokens(model, 500, 555);
+
+    llama_tokens tokens_a = prefix;
+    tokens_a.insert(tokens_a.end(), tail_a.begin(), tail_a.end());
+
+    llama_tokens tokens_b = prefix;
+    tokens_b.insert(tokens_b.end(), tail_b.begin(), tail_b.end());
+
+    auto ctx_a = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    if (!decode_tokens(ctx_a.get(), tokens_a, 0, prefix.size(), 0)) {
+        return false;
+    }
+    if (llama_state_seq_save_incr(ctx_a.get(), session.c_str(), 0, tokens_a.data(), prefix.size()) < 1) {
+        return false;
+    }
+    if (!decode_tokens(ctx_a.get(), tokens_a, prefix.size(), tokens_a.size(), 0)) {
+        return false;
+    }
+    if (llama_state_seq_save_incr(ctx_a.get(), session.c_str(), 0, tokens_a.data(), tokens_a.size()) < 1) {
+        return false;
+    }
+
+    auto ctx_b = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
+    const size_t n_restored = llama_state_seq_load_incr(ctx_b.get(), session.c_str(), 0,
+            tokens_b.data(), tokens_b.size(), 1024, 0);
+    if (n_restored < 1024) {
+        LOG_ERR("\n%s: error: expected the saved sibling prefix to restore, got %zu tokens\n", __func__, n_restored);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
 // Test 8: GGSD partial KV
 // - decode 3000 tokens, save -> 2 segments
 // - evict cells [1024, 3000), save -> chain is preserved (files on disk stay
@@ -1007,6 +1066,11 @@ int main(int argc, char ** argv) {
 
     // Test 7: GGSD fork
     if (!test_incr_fork(model, params)) {
+        return 1;
+    }
+
+    // Test 7b: GGSD saved prefix survives a child save
+    if (!test_incr_fork_prefix(model, params)) {
         return 1;
     }
 

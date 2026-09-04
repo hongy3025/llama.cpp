@@ -1463,8 +1463,8 @@ private:
         return nullptr;
     }
 
-    // fire-and-forget GGSD autosave at completion end; failures only log
-    void slot_autosave(server_slot & slot) {
+    // fire-and-forget GGSD autosave; failures only log
+    void slot_autosave(server_slot & slot, size_t n_tokens = SIZE_MAX) {
         if (!params_base.prompt_cache_ssd || slot.task == nullptr ||
                 slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
             return;
@@ -1475,7 +1475,8 @@ private:
         }
 
         const auto & tokens = slot.prompt.tokens.get_tokens();
-        if (tokens.size() < (size_t) params_base.prompt_cache_ssd_min_prefix) {
+        n_tokens = std::min(n_tokens, tokens.size());
+        if (n_tokens < (size_t) params_base.prompt_cache_ssd_min_prefix) {
             return;
         }
 
@@ -1484,7 +1485,7 @@ private:
         const std::string session_file = params_base.slot_save_path + "session___autosave__.bin";
 
         const int32_t n_segments = llama_state_seq_save_incr(ctx_tgt, session_file.c_str(),
-                slot.id, tokens.data(), tokens.size());
+                slot.id, tokens.data(), n_tokens);
         if (n_segments < 0) {
             SLT_WRN(slot, "%s", "GGSD autosave failed - ignoring\n");
         } else {
@@ -3738,6 +3739,9 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        if (is_user_start) {
+                            slot_autosave(slot, n_tokens_start);
+                        }
                     }
                 }
 

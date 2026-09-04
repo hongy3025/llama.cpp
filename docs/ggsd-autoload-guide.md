@@ -50,7 +50,7 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 
 **没有新的 API、没有新的请求字段**。你照常发 `/completion`;区别只在服务端内部:
 
-- **自动落盘(autosave)**:completion 结束、槽位释放时,服务端自动把该槽位的完整序列(含生成部分)保存到共享 session `__autosave__`;不足 1024 token 或没有跨出新段边界时是近零成本 no-op;失败(磁盘满等)只打日志,不影响请求;
+- **自动落盘(autosave)**:服务端在用户消息边界保存可分叉前缀,并在 completion 结束、槽位释放时保存完整序列(含生成部分)到共享 session `__autosave__`;不足 1024 token 或内容已存在时是近零成本 no-op;失败(磁盘满等)只打日志,不影响请求;
 - **自动恢复(autoload)**:命中时服务端日志出现 `autoloaded <N> GGSD tokens (slot X, cache Y)`,响应里 `timings.prompt_n` 只覆盖恢复前缀之后的 token 数;
 - 未命中时:与今天完全一样,槽位续用或全量 prefill。
 
@@ -117,7 +117,7 @@ slot 胜出              -> 什么都不做
 size_t state_seq_load_incr_estimate(session_path, seq_id, tokens, n, min_prefix) const;
 ```
 
-实现 = 对 `tokens` 逐段计算哈希链(纯 SHA-256,无磁盘读取)+ 沿链对每个 `seg_<hash>.bin` 做一次 `stat` 判存在。万级 prompt 只是十几次 stat,微秒级。段池的"文件存在即有效"性质(基础手册 2.1:段不可变、自认证)使**不读内容就能精确知道能恢复多少**。SWA 直接返回 0;标准 cache 下 M-RoPE 也已放开(`cell_ext` 随追加式恢复还原)。hybrid 模型走独立的 rec 头部扫描(见 2.8)。
+实现 = 对 `tokens` 逐段计算哈希链(纯 SHA-256,无磁盘读取)+ 沿链对每个 `seg/<hh>/<hash>` 做一次 `stat` 判存在。万级 prompt 只是十几次 stat,微秒级。段池的"文件存在即有效"性质(基础手册 2.1:段不可变、自认证)使**不读内容就能精确知道能恢复多少**。SWA 直接返回 0;标准 cache 下 M-RoPE 也已放开(`cell_ext` 随追加式恢复还原)。hybrid 模型走独立的 rec 头部扫描(见 2.8)。
 
 因此自动路径的 miss 成本可以忽略,不需要命中率学习或缓存决策结果。
 
@@ -165,18 +165,18 @@ hybrid split 模式不走差量回放:rec 状态钉死覆盖量,`n_prefix_valid`
 
 ### 2.7 自动落盘(autosave)
 
-触发点在 completion 结束、槽位释放处(生成停止的两个路径)。直接调用 `llama_state_seq_save_incr`,session 文件固定为段池目录下的 `session___autosave__.bin`(注意:C API 的 `session_path` 参数是 session **文件**路径,段池是其父目录)。共享单链的意义:多个槽位交替保存不同链时,分叉探测只看文件存在性,提示文件过期无害;段按内容寻址,跨槽共享不受 session 名影响。
+触发点有两个:处理用户消息前的 context checkpoint,以及 completion 结束、槽位释放处(生成停止的两个路径)。两处都调用 `llama_state_seq_save_incr`,session 文件固定为段池目录下的 `session___autosave__.bin`(注意:C API 的 `session_path` 参数是 session **文件**路径,段池是其父目录)。用户边界快照保存 system/tools 等可分叉前缀;completion 快照支持同一对话继续。共享单链的意义:多个槽位交替保存不同链时,分叉探测只看文件存在性,提示文件过期无害;段按内容寻址,跨槽共享不受 session 名影响。
 
 安全边界:fire-and-forget - save 失败(磁盘满、context shift 后的 R4 位置偏移拒绝等)只打 `SRV_WRN`,绝不影响请求结果;非 completion 任务、mtmd 序列、不足一段的 prompt 直接跳过。
 
 ### 2.8 hybrid 模型(Qwen3.5 家族):split 模式下的自动闭环
 
-`--prompt-cache-ssd` 现在同时覆盖两类 memory:`llama_kv_cache` 走上述段模式(行为不变);`llama_memory_hybrid` 走 split 模式(基础手册 1.7:共享 attn 段 + 每份保存状态一个 `rec_<chain_hash>.bin`);其余 cache 类(`llama_kv_cache_iswa`、纯 recurrent、hybrid-iswa)照旧拒绝。SWA 混合被拒绝,`--swa-full` 与此无关。
+`--prompt-cache-ssd` 现在同时覆盖两类 memory:`llama_kv_cache` 走上述段模式(行为不变);`llama_memory_hybrid` 走 split 模式(基础手册 1.7:共享 attn 段 + 每份保存状态一个 `rec/<hh>/<hash>`);其余 cache 类(`llama_kv_cache_iswa`、纯 recurrent、hybrid-iswa)照旧拒绝。SWA 混合被拒绝,`--swa-full` 与此无关。
 
 对自动路径的影响:
 
-- **仲裁接口不变**。hybrid 的预估改为扫描 `rec_*.bin` 头部(只读头部,不读 token 数组,每头几 KB):命中条件 = 请求 token 前缀的链哈希等于文件的 `chain_hash`,并且用与 load 完全相同的覆盖规则校验段存在性 - 该 rec 自身链长 `(n_tokens - n_tail) / 1024` 所需的段必须都在盘上;池中来自其他会话的更长链不影响命中(load 只重放 rec 自身链长的段,再接 tail,不会与更长的盘上链冲突)。报价 = 该文件的 `n_tokens`。`min_prefix` / margin 规则不变。
-- **匹配更严**:请求必须精确延长某条已保存的对话(rec 状态无法从中间截断,段文件不单独扩大覆盖)。连续对话(下一轮 prompt = 上一轮全文 + 新内容)天然满足;分叉对话共享磁盘上的对齐 attn 段,但各自需要新的 rec 文件。
+- **仲裁接口不变**。hybrid 的预估改为扫描 `rec/<hh>/` 下的文件头部(只读头部,不读 token 数组,每头几 KB):命中条件 = 请求 token 前缀的链哈希等于文件的 `chain_hash`,并且用与 load 完全相同的覆盖规则校验段存在性 - 该 rec 自身链长 `(n_tokens - n_tail) / 1024` 所需的段必须都在盘上;池中来自其他会话的更长链不影响命中(load 只重放 rec 自身链长的段,再接 tail,不会与更长的盘上链冲突)。报价 = 该文件的 `n_tokens`。`min_prefix` / margin 规则不变。
+- **匹配更严**:请求必须精确延长某个已保存的 rec 快照(rec 状态无法从中间截断,段文件不单独扩大覆盖)。服务端在用户消息边界保存可分叉前缀,因此连续对话和共享 system/tools 前缀的新对话都能命中。
 - **成本**:hybrid 命中路径没有差量回放(见 2.3),整段重放;每份会话状态的磁盘占用 = rec 状态(固定,几 MB)+ 非对齐 attn 尾部(最多 1023 token)。
-- **落盘即清理**:autosave 写完新 rec 文件后删除被其支配(token 序列是其严格前缀)的旧 rec 文件,每条链只留最新状态;段池仍无自动 GC,手动删。
+- **保留存盘点**:父 rec 必须保留供兄弟分支恢复,不能由更长的子 rec 替代。rec 与段池均无自动 GC,手动删。
 - autosave 失败兜底、`--cache-ram` 共存、mtmd 跳过等语义与标准模型完全一致。
