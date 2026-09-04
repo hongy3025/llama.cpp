@@ -671,10 +671,11 @@ size_t llama_context::state_seq_save_incr_hybrid(
 
     // rec file: attn tail + recurrent snapshot, coverage = n_token_count.
     // the GGSD session file is deliberately NOT touched here (pool semantics).
-    if (n_token_count >= GGSD_SEGMENT_TOKENS) {
+    // no segment-alignment floor: the rec is self-contained, so short chains
+    // are usable as long as the caller's min_prefix policy allows them.
+    {
         const std::string chain_hash = ggsd_prefix_hash(model_id, kv_params, tokens, n_token_count);
         const std::string fname = ggsd_rec_path(session_path, chain_hash);
-
         bool rec_written = std::filesystem::exists(fname);
 
         if (!rec_written) {
@@ -879,10 +880,6 @@ size_t llama_context::state_seq_load_incr_hybrid(
               size_t   n_prompt_tokens,
               size_t   min_prefix_tokens,
               llama_memory_hybrid & mem) {
-    if (n_prompt_tokens < GGSD_SEGMENT_TOKENS) {
-        return 0;
-    }
-
     auto * kv_attn  = mem.get_mem_attn();
     auto * mem_recr = mem.get_mem_recr();
 
@@ -906,10 +903,11 @@ size_t llama_context::state_seq_load_incr_hybrid(
     }
 
     // best rec candidate: header chain_hash must equal the recomputed prefix
-    // hash of the request, and segments + tail must exactly tile the coverage
+    // hash of the request, and the segments under its tail must exist on disk
     size_t best_tokens = 0;
     std::filesystem::path best_path;
     ggsd_rec_header best_h;
+    size_t n_chain_best = 0;
 
     std::filesystem::path rec_dir = std::filesystem::path(session_path).parent_path();
     if (rec_dir.empty()) {
@@ -941,13 +939,17 @@ size_t llama_context::state_seq_load_incr_hybrid(
             if (h.chain_hash != ggsd_prefix_hash(model_id, kv_params, prompt_tokens, h.n_tokens)) {
                 continue;
             }
-            // the tail must start exactly where the on-disk segments end
-            if (h.n_tail != h.n_tokens - n_seg_ok * GGSD_SEGMENT_TOKENS) {
+            // the rec's own chain segments must exist for this request; the pool
+            // may hold longer chains from other sessions (n_seg_ok > chain)
+            const size_t n_chain_rec = (size_t) (h.n_tokens - h.n_tail) / GGSD_SEGMENT_TOKENS;
+            if ((size_t) h.n_tokens - h.n_tail != n_chain_rec * GGSD_SEGMENT_TOKENS ||
+                    n_seg_ok < n_chain_rec) {
                 continue;
             }
-            best_tokens = h.n_tokens;
-            best_path   = entry.path();
-            best_h      = std::move(h);
+            best_tokens   = h.n_tokens;
+            best_path     = entry.path();
+            best_h        = std::move(h);
+            n_chain_best  = n_chain_rec;
         } catch (...) {
             continue;
         }
@@ -963,7 +965,8 @@ size_t llama_context::state_seq_load_incr_hybrid(
 
     size_t n_loaded = 0;
     try {
-        for (size_t k = 0; k < n_seg_ok; ++k) {
+        // replay only the rec's own chain - the tail appends right after it
+        for (size_t k = 0; k < n_chain_best; ++k) {
             if (!ggsd_read_segment(kv_attn, session_path, k, hashes, model_id, kv_params, seq_id)) {
                 throw std::runtime_error("segment failed validation during replay");
             }
@@ -1022,12 +1025,12 @@ size_t llama_context::state_seq_load_incr_estimate(
         const llama_token * prompt_tokens,
               size_t   n_prompt_tokens,
               size_t   min_prefix_tokens) const {
-    if (n_prompt_tokens < GGSD_SEGMENT_TOKENS) {
-        return 0;
-    }
-
     if (auto * mem = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
         return state_seq_estimate_hybrid(session_path, prompt_tokens, n_prompt_tokens, min_prefix_tokens, *mem);
+    }
+
+    if (n_prompt_tokens < GGSD_SEGMENT_TOKENS) {
+        return 0;
     }
 
     auto * kv = dynamic_cast<const llama_kv_cache *>(memory.get());
@@ -1060,10 +1063,6 @@ size_t llama_context::state_seq_estimate_hybrid(
               size_t   n_prompt_tokens,
               size_t   min_prefix_tokens,
               const llama_memory_hybrid & mem) const {
-    if (n_prompt_tokens < GGSD_SEGMENT_TOKENS) {
-        return 0;
-    }
-
     if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         return 0;
     }
@@ -1112,8 +1111,10 @@ size_t llama_context::state_seq_estimate_hybrid(
             if (h.chain_hash != ggsd_prefix_hash(model_id, kv_params, prompt_tokens, h.n_tokens)) {
                 continue;
             }
-            // the tail must start exactly where the on-disk segments end
-            if (h.n_tail != h.n_tokens - n_seg_ok * GGSD_SEGMENT_TOKENS) {
+            // same coverage rule as the load path
+            const size_t n_chain_rec = (size_t) (h.n_tokens - h.n_tail) / GGSD_SEGMENT_TOKENS;
+            if ((size_t) h.n_tokens - h.n_tail != n_chain_rec * GGSD_SEGMENT_TOKENS ||
+                    n_seg_ok < n_chain_rec) {
                 continue;
             }
             best_tokens = h.n_tokens;

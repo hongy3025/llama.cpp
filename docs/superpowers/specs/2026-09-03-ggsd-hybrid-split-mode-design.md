@@ -174,8 +174,12 @@ Deviations from the design text above, settled during implementation review:
   non-contiguous lengths. The cleanup runs only when the child rec file
   exists (written now or already on disk), so a skipped child write never
   deletes the surviving parent.
-- Estimate verifies segment availability with the same tiling rule as load:
-  the longest existing aligned segment prefix is computed first and a
-  candidate is only priced when `n_tail == n_tokens - 1024 * n_seg_ok`, so
-  an estimate hit cannot be priced on missing segments. Estimate reads
-  headers only (no token array).
+- Estimate verifies segment availability with the same coverage rule as load:
+  a candidate is priced when the segments under its own tail all exist for the
+  request, i.e. `n_tail < 1024`, `(n_tokens - n_tail)` is a multiple of 1024,
+  and `n_seg_ok >= (n_tokens - n_tail) / 1024`. The old equality
+  `n_tail == n_tokens - 1024 * n_seg_ok` wrongly rejected a rec whenever the
+  pool held a longer chain from another session (`n_seg_ok >` the rec's own
+  chain length). Load replays only the rec's own chain segments, then appends
+  the tail, so a longer on-disk chain is never overwritten by the tail. Estimate
+  reads headers only (no token array).
