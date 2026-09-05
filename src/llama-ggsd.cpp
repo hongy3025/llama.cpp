@@ -61,11 +61,21 @@ std::vector<std::filesystem::path> list_pool_files(const std::filesystem::path &
     std::vector<std::filesystem::path> out; const auto root = pool / (kind == object_kind::segment ? "seg" : "rec");
     const auto status = std::filesystem::symlink_status(root, ec); if (ec || !std::filesystem::is_directory(status)) return out;
     for (const auto & shard : std::filesystem::directory_iterator(root, ec)) {
-        if (ec) break; const auto ss = std::filesystem::symlink_status(shard.path(), ec);
-        if (ec || !std::filesystem::is_directory(ss) || shard.path().filename().string().size() != 2) continue;
+        if (ec) {
+            break;
+        }
+        const auto ss = std::filesystem::symlink_status(shard.path(), ec);
+        if (ec || !std::filesystem::is_directory(ss) || shard.path().filename().string().size() != 2) {
+            continue;
+        }
         for (const auto & e : std::filesystem::directory_iterator(shard.path(), ec)) {
-            if (ec) break; const auto es = std::filesystem::symlink_status(e.path(), ec);
-            if (!ec && std::filesystem::is_regular_file(es) && is_hash_name(e.path().filename().string()) && e.path().filename().string().substr(0,2) == shard.path().filename()) out.push_back(e.path());
+            if (ec) {
+                break;
+            }
+            const auto es = std::filesystem::symlink_status(e.path(), ec);
+            if (!ec && std::filesystem::is_regular_file(es) && is_hash_name(e.path().filename().string()) && e.path().filename().string().substr(0,2) == shard.path().filename()) {
+                out.push_back(e.path());
+            }
         }
     }
     return out;

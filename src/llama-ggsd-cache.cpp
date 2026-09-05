@@ -8,7 +8,7 @@ namespace llama_ggsd {
 namespace {
 uint64_t add_size(uint64_t a, uint64_t b, bool & ok) { if (b > UINT64_MAX-a) { ok=false; return 0; } return a+b; }
 bool zero_hash(const std::string & s) { return s.size()==HASH_HEX_LEN && s.find_first_not_of('\0')==std::string::npos; }
-void refresh(cache_graph & g, const std::filesystem::path & p, const cache_file_ops & ops) {
+void refresh(cache_graph & g, const std::filesystem::path & p) {
     std::error_code ec;
     for (auto kind : {object_kind::segment, object_kind::rec}) {
         for (const auto & path : list_pool_files(p, kind, ec)) {
@@ -79,7 +79,7 @@ void refresh(cache_graph & g, const std::filesystem::path & p, const cache_file_
 }
 }
 cache_file_ops cache_file_ops::system(){return {[](const auto&p,std::error_code&e){return std::filesystem::remove(p,e);},[](const auto&a,const auto&b,std::error_code&e){std::filesystem::rename(a,b,e);return !e;},[](const auto&p,auto t,std::error_code&e){std::filesystem::last_write_time(p,t,e);return !e;},[](){return std::chrono::steady_clock::now();}};}
-cache_graph scan_pool(const std::filesystem::path & p,const cache_file_ops & ops){cache_graph g;auto begin=std::chrono::steady_clock::now();std::error_code ec; if(!std::filesystem::is_directory(std::filesystem::symlink_status(p,ec))||ec){g.error=ec?ec.message():"pool is not a directory";return g;} refresh(g,p,ops);g.enumerate_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-begin).count();return g;}
+cache_graph scan_pool(const std::filesystem::path & p,const cache_file_ops & ops){cache_graph g;auto begin=ops.now_steady();std::error_code ec; if(!std::filesystem::is_directory(std::filesystem::symlink_status(p,ec))||ec){g.error=ec?ec.message():"pool is not a directory";return g;} refresh(g,p);g.enumerate_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(ops.now_steady()-begin).count();return g;}
 cache::cache(const std::filesystem::path&p,uint64_t m,cache_file_ops o):pool_(p),max_bytes_(m),ops_(std::move(o)){}
 std::unique_ptr<cache> cache::open(const std::filesystem::path & p, uint64_t m, cache_file_ops o, std::string & e) {
     auto c = std::unique_ptr<cache>(new cache(p, m, std::move(o)));

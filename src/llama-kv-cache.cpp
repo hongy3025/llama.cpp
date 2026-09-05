@@ -2146,6 +2146,7 @@ void llama_kv_cache::state_read_sinfo(
       slot_info_vec_t *   sinfos_out,
 const slot_info_vec_t *   sinfos_in,
                       bool append) {
+    GGML_UNUSED(flags);
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
