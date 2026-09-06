@@ -225,6 +225,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--prompt-cache-ssd, --no-prompt-cache-ssd` | enable/disable GGSD prompt-prefix autoload and autosave; requires `--slot-save-path` (default: disabled) |
+| `--prompt-cache-ssd-min-prefix N` | minimum reusable prefix tokens for GGSD autoload/autosave (default: 1024; segment size: 256) |
+| `--prompt-cache-ssd-margin N` | minimum token lead over the runner-up cache source for GGSD autoload (default: 256) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |

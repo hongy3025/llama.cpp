@@ -20,9 +20,8 @@ fi
 
 mkdir -p "$SAVE_DIR"
 
-# --prompt-cache-ssd: GGSD autoload + autosave (thresholds tunable:
-#   --prompt-cache-ssd-min-prefix N  default 1024
-#   --prompt-cache-ssd-margin N      default 256)
+# --prompt-cache-ssd: GGSD autoload + autosave.
+#   GGSD segments are 256 tokens; the thresholds below are tunable.
 exec "$BIN" \
     -m "$MODEL" \
     --n-gpu-layers all \
@@ -31,6 +30,8 @@ exec "$BIN" \
     --port "$PORT" \
     --slot-save-path "$SAVE_DIR" \
     --prompt-cache-ssd \
+    --prompt-cache-ssd-min-prefix 256 \
+    --prompt-cache-ssd-margin 64 \
     -np 4 \
     --kv-unified \
     --ctx-size 131072 \

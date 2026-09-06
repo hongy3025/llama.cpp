@@ -3,6 +3,8 @@
 Date: 2026-07-31 (amended 2026-09-02, see docs/plans/2026-09-02-ggsd-remediation.md)
 
 Status: Approved, amended after design review
+Amendment (2026-09-06): GGSD segment granularity is reduced to 256 tokens and the on-disk version is 2. References to 1024-token segment boundaries below are historical values from version 1; the implementation and current user guides use 256.
+
 
 Amendment (2026-09-03): the "standard kv cache only" scope below is superseded
 by `docs/superpowers/specs/2026-09-03-ggsd-hybrid-split-mode-design.md`:
