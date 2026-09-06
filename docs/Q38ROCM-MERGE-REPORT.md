@@ -17,12 +17,17 @@ Qwen3.8 target 与独立 NextN MTP draft 做实际服务验证。
 | 项目 | 值 |
 | --- | --- |
 | 基线 | `10974376c` (`hongy_main`) |
+| q38rocm merge 源仓库 | <https://github.com/julianmb/q38rocm> |
 | q38rocm engine 固定源 | `75e67a92b2d230849aec2d6c1f7b1d1fd624e0e0` |
 | 共同 merge-base | `8e53fcefd2c01ff70434ab41866bfc2eca31fe90` |
 | 合并提交 | `a6c89be50` `merge: integrate q38rocm ROCmFPX engine` |
 | 服务 profile | `7bb60641f` `scripts: use q38rocm dense Qwen MTP profile` |
 | 响应解析修正 | `924fd44f4` `scripts: parse disabled reasoning traces` |
 | 保留的原分支 | `feat/rocmfpx` @ `7dadb66da` |
+
+本次 merge 的上游仓库为 [julianmb/q38rocm](https://github.com/julianmb/q38rocm)；
+实际合入的是该仓库 `engine/src` 对应的固定 engine source commit，而不是 wrapper
+根目录中的部署脚本、NPU pipeline 或主机调优脚本。
 
 q38rocm engine 以本地 remote `q38rocm-engine` 固定到上述源提交后合并。合并相对
 `hongy_main` 覆盖 485 个文件；报告只列出影响本目标的类别，而不是重复完整 diff。
