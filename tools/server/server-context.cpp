@@ -12,6 +12,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "src/llama-context.h" // for state_seq_load_incr_estimate (GGSD autoload)
+#include "src/llama-ggsd.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1779,12 +1780,12 @@ private:
         }
 
         if (n_ggsd >= n_best && n_ggsd - std::max(n_slot, n_cache) >= (size_t) params_base.prompt_cache_ssd_margin) {
-            size_t m_aligned = std::min(n_slot, n_ggsd) / 1024 * 1024;
+            size_t m_aligned = std::min(n_slot, n_ggsd) / llama_ggsd::SEGMENT_TOKENS * llama_ggsd::SEGMENT_TOKENS;
             const bool lcp_complete = n_slot > 0 && n_slot == slot.prompt.tokens.size()
                 && slot.prompt.tokens.get_tokens().size() >= m_aligned;
 
             size_t n_restored = 0;
-            if (lcp_complete && m_aligned >= 1024) {
+            if (lcp_complete && m_aligned >= llama_ggsd::SEGMENT_TOKENS) {
                 n_restored = llama_state_seq_load_incr(ctx_tgt, session_file.c_str(),
                         slot.id, task_tokens.data(), task_tokens.size(), (size_t) params_base.prompt_cache_ssd_min_prefix, m_aligned);
             } else {
@@ -2870,7 +2871,7 @@ private:
                     res->filename   = filename;
                     res->is_save    = true;
                     res->n_segments = n_segments;
-                    res->n_tokens   = (size_t) n_segments * 1024;
+                    res->n_tokens   = (size_t) n_segments * llama_ggsd::SEGMENT_TOKENS;
                     res->t_ms       = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;

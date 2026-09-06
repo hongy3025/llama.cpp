@@ -12,8 +12,8 @@ class llama_file;
 
 namespace llama_ggsd {
 
-constexpr uint32_t VERSION = 1;
-constexpr uint32_t SEGMENT_TOKENS = 1024;
+constexpr uint32_t VERSION = 2;
+constexpr uint32_t SEGMENT_TOKENS = 256;
 constexpr size_t HASH_BYTES = 16;
 constexpr size_t HASH_HEX_LEN = 32;
 constexpr uint32_t MAX_IDENTITY_BYTES = 1U << 20;

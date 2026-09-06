@@ -40,8 +40,8 @@ llama-server -m model.gguf --slot-save-path saves --prompt-cache-ssd
 两个阈值参数(默认 1024/256,可用命令行调整):
 
 | 参数 | 默认 | 含义 |
-|---|---|---|
-| `--prompt-cache-ssd-min-prefix N` | 1024 | 至少能复用这么多 token 才触发磁盘恢复/落盘(建议为段大小 1024 的倍数) |
+|---|---:|---|
+| `--prompt-cache-ssd-min-prefix N` | 1024 | 至少能复用这么多 token 才触发磁盘恢复/落盘(建议为 256 的倍数) |
 | `--prompt-cache-ssd-margin N` | 256 | GGSD 必须比次优来源多出至少这么多 token 才胜出 |
 
 Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比 RAM cache 多赚几个 token,不值得。关闭开关时,服务端行为与不装此特性**逐字节一致**。
@@ -50,7 +50,7 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 
 **没有新的 API、没有新的请求字段**。你照常发 `/completion`;区别只在服务端内部:
 
-- **自动落盘(autosave)**:服务端在用户消息边界保存可分叉前缀,并在 completion 结束、槽位释放时保存完整序列(含生成部分)到共享 session `__autosave__`;不足 1024 token 或内容已存在时是近零成本 no-op;失败(磁盘满等)只打日志,不影响请求;
+- **自动落盘(autosave)**:服务端在用户消息边界保存可分叉前缀,并在 completion 结束、槽位释放时保存完整序列(含生成部分)到共享 session `__autosave__`;不足 256 token 或内容已存在时是近零成本 no-op;失败(磁盘满等)只打日志,不影响请求;
 - **自动恢复(autoload)**:命中时服务端日志出现 `__GGSD__ autoload: restored <N> tokens (slot X, cache Y)`,响应里 `timings.prompt_n` 只覆盖恢复前缀之后的 token 数;
 - 未命中时:与今天完全一样,槽位续用或全量 prefill。
 
@@ -58,8 +58,8 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 
 ```
 关闭开关:  prompt_n = 2001   (全量 prefill)
-开启开关:  prompt_n = 977    (前 1024 token 从磁盘自动恢复)
-          日志: slot autoload_ggs: id  3 | task -1 | __GGSD__ autoload: restored 1024 tokens (slot 0, cache 0)
+开启开关:  prompt_n = 1745   (前 256 token 从磁盘自动恢复)
+          日志: slot autoload_ggs: id  3 | task -1 | __GGSD__ autoload: restored 256 tokens (slot 0, cache 0)
 ```
 
 手动端点 `POST /slots/{id}?action=restore_incr` 的语义不变,两者互不干扰:手动调用显式指定目标槽位与 min_prefix;自动路径只在槽位分配瞬间、按统一阈值决策。
@@ -68,8 +68,8 @@ Margin 的作用是防抖:GGSD 恢复一次约 65ms/段的磁盘 IO,如果只比
 
 | 场景 | 行为 |
 |---|---|
-| 槽位/RAM cache 可复用长度 >= 1024,且 GGSD 帮不上更多 | 不碰磁盘,走现有路径 |
-| GGSD 预估命中 >= 1024 且超过次优 256 | 自动从磁盘恢复,剩余部分 prefill |
+| 槽位/RAM cache 可复用长度 >= 256,且 GGSD 帮不上更多 | 不碰磁盘,走现有路径 |
+| GGSD 预估命中 >= 256 且超过次优 256 | 自动从磁盘恢复,剩余部分 prefill |
 | 槽位已有与新请求共享的 KV,GGSD 命中更长 | 差量恢复:槽位截断到段对齐边界,只回放缺失的段 |
 | GGSD 恢复中途段损坏/缺失 | 保留已验证前缀(M1),失败时清槽兜底,回退全量 prefill |
 | 恢复尝试前预估就不足 | 什么都不碰(槽位此前已被抢救进 RAM cache) |
@@ -99,7 +99,7 @@ n_cache = prompt_cache->peek(task.tokens, slot.prompt.tokens) // RAM cache 最�
 n_ggsd  = ctx->state_seq_load_incr_estimate(session, tokens)  // 零 IO 预估
 
 best = max(n_slot, n_cache, n_ggsd)
-best < 1024            -> 现行路径(cache 候选有则消费,无则清槽全量 prefill)
+best < 256            -> 现行路径(cache 候选有则消费,无则清槽全量 prefill)
 ggsd 胜出(超次优 256) -> GGSD 自动恢复
 cache 胜出             -> consume 候选条目并 set_data(即现行 load)
 slot 胜出              -> 什么都不做
@@ -131,17 +131,17 @@ size_t llama_state_seq_load_incr(..., size_t min_prefix_tokens,
 ```
 
 - `n_prefix_valid == 0`:现行语义,从链头全量重放(内部先清序列),手动端点走这条;
-- `n_prefix_valid == m > 0`:声明槽位已持有 `[0, m)` 的有效 KV。实现计算 `k0 = m / 1024`:
+- `n_prefix_valid == m > 0`:声明槽位已持有 `[0, m)` 的有效 KV。实现计算 `k0 = m / 256`:
   - 哈希链仍从头计算(身份自认证不变),但**跳过的段 `[0, k0)` 连 stat 都不做**;
   - 存在性检查、payload 哈希校验、`state_read_append` 重放都只对 `k >= k0`;
-  - 截断由 load 自己完成:`seq_rm(seq_id, k0*1024, -1)`(丢弃不足一段的尾部,最多 1023 个 token 的 KV,这些本就在"差异部分"里);
-  - 返回值 = `(已重放段数 + k0) * 1024`,始终与槽位实际覆盖一致(M1 语义)。
+  - 截断由 load 自己完成:`seq_rm(seq_id, k0*256, -1)`(丢弃不足一段的尾部,最多 255 个 token 的 KV,这些本就在"差异部分"里);
+  - 返回值 = `(已重放段数 + k0) * 256`,始终与槽位实际覆盖一致(M1 语义)。
 
-服务端侧的差量触发条件:`n_slot >= 1024` 且槽位 token 恰好是请求 token 的前缀(LCP 完整,否则跳过的段与槽位 KV 不对应)。对齐公式 `m_aligned = floor(min(n_slot, n_ggsd)/1024)*1024` 保证不重叠。
+服务端侧的差量触发条件:`n_slot >= 256` 且槽位 token 恰好是请求 token 的前缀(LCP 完整,否则跳过的段与槽位 KV 不对应)。对齐公式 `m_aligned = floor(min(n_slot, n_ggsd)/256)*256` 保证不重叠。
 
 hybrid split 模式不走差量回放:rec 状态钉死覆盖量,`n_prefix_valid` 被忽略,始终全量重放(见 2.8)。
 
-强验证(已入测试 Test 11):decode 2500 → save 2 段 → **删掉段 0 文件** → 用 `n_prefix_valid=1024` 恢复,仍得 2048 且生成与参考一致 - 证明跳过的段从未被读;同一删除下 `n_prefix_valid=0` 则恢复 0。
+强验证(已入测试 Test 11):decode 2500 -> save 9 段 -> **删掉段 0 文件** -> 用 `n_prefix_valid=1280` 恢复,仍得 2304 且生成与参考一致 - 证明跳过的段从未被读;同一删除下 `n_prefix_valid=0` 则恢复 0。
 
 ### 2.4 失败一致性:为什么失败路径必须清槽
 
@@ -175,7 +175,7 @@ hybrid split 模式不走差量回放:rec 状态钉死覆盖量,`n_prefix_valid`
 
 对自动路径的影响:
 
-- **仲裁接口不变**。hybrid 的预估改为扫描 `rec/<hh>/` 下的文件头部(只读头部,不读 token 数组,每头几 KB):命中条件 = 请求 token 前缀的链哈希等于文件的 `chain_hash`,并且用与 load 完全相同的覆盖规则校验段存在性 - 该 rec 自身链长 `(n_tokens - n_tail) / 1024` 所需的段必须都在盘上;池中来自其他会话的更长链不影响命中(load 只重放 rec 自身链长的段,再接 tail,不会与更长的盘上链冲突)。报价 = 该文件的 `n_tokens`。`min_prefix` / margin 规则不变。
+- **仲裁接口不变**。hybrid 的预估改为扫描 `rec/<hh>/` 下的文件头部(只读头部,不读 token 数组,每头几 KB):命中条件 = 请求 token 前缀的链哈希等于文件的 `chain_hash`,并且用与 load 完全相同的覆盖规则校验段存在性 - 该 rec 自身链长 `(n_tokens - n_tail) / 256` 所需的段必须都在盘上;池中来自其他会话的更长链不影响命中(load 只重放 rec 自身链长的段,再接 tail,不会与更长的盘上链冲突)。报价 = 该文件的 `n_tokens`。
 - **匹配更严**:请求必须精确延长某个已保存的 rec 快照(rec 状态无法从中间截断,段文件不单独扩大覆盖)。服务端在用户消息边界保存可分叉前缀,因此连续对话和共享 system/tools 前缀的新对话都能命中。
-- **成本**:hybrid 命中路径没有差量回放(见 2.3),整段重放;每份会话状态的磁盘占用 = rec 状态(固定,几 MB)+ 非对齐 attn 尾部(最多 1023 token)。
+- **成本**:hybrid 命中路径没有差量回放(见 2.3),整段重放;每份会话状态的磁盘占用 = rec 状态(固定,几 MB)+ 非对齐 attn 尾部(最多 255 token)。
 - **保留存盘点与配额**: 父 rec 必须保留供兄弟分支恢复,不能由更长的子 rec 替代。配置 `--prompt-cache-ssd-max-mib N`（默认 `0`，环境变量 `LLAMA_ARG_PROMPT_CACHE_SSD_MAX_MIB`）后，`seg`、`rec` 和临时文件受硬字节上限约束；压力写入前同步 Leaf-LRU 回收到 90% 低水位。共享前缀保持闭合，手动/自动保存同优先级；成功恢复分别触碰最深段或选中的 rec，十分钟内限频。超限只造成缓存覆盖下降并回退 prefill，不影响推理；正值也管理未启用 autosave/autoload 的手动端点。单写者、无后台线程。

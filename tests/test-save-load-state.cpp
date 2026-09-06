@@ -488,8 +488,8 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 }
 
 // Test 5: GGSD save/load roundtrip
-// - decode 2500 tokens, save (2 segments)
-// - restore 2048 tokens in a fresh context, decode the remainder, generate
+// - decode 2500 tokens, save (9 segments)
+// - restore 2304 tokens in a fresh context, decode the remainder, generate
 // - compare the generation against the reference (same KV -> same logits)
 static bool test_incr_roundtrip(struct llama_model * model, const struct common_params & params) {
     incr_test_cleanup();
@@ -503,8 +503,8 @@ static bool test_incr_roundtrip(struct llama_model * model, const struct common_
     }
 
     const int32_t n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
-    if (n_segments != 2) {
-        LOG_ERR("\n%s: error: expected 2 segments after first save, got %d\n", __func__, n_segments);
+    if (n_segments != 9) {
+        LOG_ERR("\n%s: error: expected 9 segments after first save, got %d\n", __func__, n_segments);
         return false;
     }
 
@@ -523,8 +523,8 @@ static bool test_incr_roundtrip(struct llama_model * model, const struct common_
     auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
 
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
-    if (n_restored != 2048) {
-        LOG_ERR("\n%s: error: expected 2048 tokens restored, got %zu\n", __func__, n_restored);
+    if (n_restored != 2304) {
+        LOG_ERR("\n%s: error: expected 2304 tokens restored, got %zu\n", __func__, n_restored);
         return false;
     }
 
@@ -536,9 +536,9 @@ static bool test_incr_roundtrip(struct llama_model * model, const struct common_
 }
 
 // Test 6: GGSD incremental save
-// - decode 1500 tokens, save -> 1 segment
-// - decode 1100 more, save -> 2 segments, only 1 new file
-// - restore -> 2048 tokens
+// - decode 1500 tokens, save -> 5 segments
+// - decode 1100 more, save -> 10 segments, only 5 new files
+// - restore -> 2560 tokens
 static bool test_incr_append(struct llama_model * model, const struct common_params & params) {
     incr_test_cleanup();
 
@@ -551,12 +551,12 @@ static bool test_incr_append(struct llama_model * model, const struct common_par
     }
 
     int32_t n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), 1500);
-    if (n_segments != 1) {
-        LOG_ERR("\n%s: error: expected 1 segment after first save, got %d\n", __func__, n_segments);
+    if (n_segments != 5) {
+        LOG_ERR("\n%s: error: expected 5 segments after first save, got %d\n", __func__, n_segments);
         return false;
     }
-    if (count_segment_files() != 1) {
-        LOG_ERR("\n%s: error: expected 1 segment file, got %zu\n", __func__, count_segment_files());
+    if (count_segment_files() != 5) {
+        LOG_ERR("\n%s: error: expected 5 segment files, got %zu\n", __func__, count_segment_files());
         return false;
     }
 
@@ -565,20 +565,20 @@ static bool test_incr_append(struct llama_model * model, const struct common_par
     }
 
     n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), 2600);
-    if (n_segments != 2) {
-        LOG_ERR("\n%s: error: expected 2 segments after append save, got %d\n", __func__, n_segments);
+    if (n_segments != 10) {
+        LOG_ERR("\n%s: error: expected 10 segments after append save, got %d\n", __func__, n_segments);
         return false;
     }
-    if (count_segment_files() != 2) {
-        LOG_ERR("\n%s: error: expected 2 segment files after append, got %zu\n", __func__, count_segment_files());
+    if (count_segment_files() != 10) {
+        LOG_ERR("\n%s: error: expected 10 segment files after append, got %zu\n", __func__, count_segment_files());
         return false;
     }
 
     auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
 
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
-    if (n_restored != 2048) {
-        LOG_ERR("\n%s: error: expected 2048 tokens restored, got %zu\n", __func__, n_restored);
+    if (n_restored != 2560) {
+        LOG_ERR("\n%s: error: expected 2560 tokens restored, got %zu\n", __func__, n_restored);
         return false;
     }
 
@@ -587,10 +587,10 @@ static bool test_incr_append(struct llama_model * model, const struct common_par
 }
 
 // Test 7: GGSD fork
-// - chain A: 3000 tokens, save -> 2 segments
-// - chain B: A[0..1500) + 1500 new tokens, save -> 2 segments, 1 shared file
-// - restore with B -> 2048 tokens (matched chain)
-// - restore with A -> 2048 tokens (orphaned chain still on disk)
+// - chain A: 3000 tokens, save -> 11 segments
+// - chain B: A[0..1500) + 1500 new tokens, save -> 11 segments, 5 shared files
+// - restore with B -> 2816 tokens (matched chain)
+// - restore with A -> 2816 tokens (orphaned chain still on disk)
 static bool test_incr_fork(struct llama_model * model, const struct common_params & params) {
     incr_test_cleanup();
 
@@ -607,8 +607,8 @@ static bool test_incr_fork(struct llama_model * model, const struct common_param
         return false;
     }
     const int32_t n_segments_a = llama_state_seq_save_incr(ctx_a.get(), session.c_str(), 0, tokens_a.data(), tokens_a.size());
-    if (n_segments_a != 2 || count_segment_files() != 2) {
-        LOG_ERR("\n%s: error: chain A expected 2 segments/2 files, got %d/%zu\n", __func__, n_segments_a, count_segment_files());
+    if (n_segments_a != 11 || count_segment_files() != 11) {
+        LOG_ERR("\n%s: error: chain A expected 11 segments/11 files, got %d/%zu\n", __func__, n_segments_a, count_segment_files());
         return false;
     }
 
@@ -617,28 +617,28 @@ static bool test_incr_fork(struct llama_model * model, const struct common_param
         return false;
     }
     const int32_t n_segments_b = llama_state_seq_save_incr(ctx_b.get(), session.c_str(), 0, tokens_b.data(), tokens_b.size());
-    if (n_segments_b != 2) {
-        LOG_ERR("\n%s: error: chain B expected 2 segments, got %d\n", __func__, n_segments_b);
+    if (n_segments_b != 11) {
+        LOG_ERR("\n%s: error: chain B expected 11 segments, got %d\n", __func__, n_segments_b);
         return false;
     }
-    if (count_segment_files() != 3) {
-        LOG_ERR("\n%s: error: expected 3 segment files after fork (1 shared + 2 unique), got %zu\n", __func__, count_segment_files());
+    if (count_segment_files() != 17) {
+        LOG_ERR("\n%s: error: expected 17 segment files after fork (5 shared + 6 unique per branch), got %zu\n", __func__, count_segment_files());
         return false;
     }
 
     // restore chain B (the session tail)
     auto ctx_rb = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored_b = llama_state_seq_load_incr(ctx_rb.get(), session.c_str(), 0, tokens_b.data(), tokens_b.size(), 64, 0);
-    if (n_restored_b != 2048) {
-        LOG_ERR("\n%s: error: chain B restore expected 2048 tokens, got %zu\n", __func__, n_restored_b);
+    if (n_restored_b != 2816) {
+        LOG_ERR("\n%s: error: chain B restore expected 2816 tokens, got %zu\n", __func__, n_restored_b);
         return false;
     }
 
     // restore chain A (orphaned but still on disk)
     auto ctx_ra = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored_a = llama_state_seq_load_incr(ctx_ra.get(), session.c_str(), 0, tokens_a.data(), tokens_a.size(), 64, 0);
-    if (n_restored_a != 2048) {
-        LOG_ERR("\n%s: error: chain A restore expected 2048 tokens, got %zu\n", __func__, n_restored_a);
+    if (n_restored_a != 2816) {
+        LOG_ERR("\n%s: error: chain A restore expected 2816 tokens, got %zu\n", __func__, n_restored_a);
         return false;
     }
 
@@ -679,8 +679,8 @@ static bool test_incr_fork_prefix(struct llama_model * model, const struct commo
 
     auto ctx_b = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored = llama_state_seq_load_incr(ctx_b.get(), session.c_str(), 0,
-            tokens_b.data(), tokens_b.size(), 1024, 0);
-    if (n_restored < 1024) {
+            tokens_b.data(), tokens_b.size(), 256, 0);
+    if (n_restored < 256) {
         LOG_ERR("\n%s: error: expected the saved sibling prefix to restore, got %zu tokens\n", __func__, n_restored);
         return false;
     }
@@ -690,13 +690,13 @@ static bool test_incr_fork_prefix(struct llama_model * model, const struct commo
 }
 
 // Test 8: GGSD partial KV
-// - decode 3000 tokens, save -> 2 segments
-// - evict cells [1024, 3000), save -> chain is preserved (files on disk stay
+// - decode 3000 tokens, save -> 11 segments
+// - evict cells [256, 3000), save -> chain is preserved (files on disk stay
 //   valid regardless of KV eviction; R2) and nothing new is written
-// - restore with the full prompt -> 2048 tokens (both segments are on disk)
-// - evict the head cells [0, 1024), save to the original session -> still 2
+// - restore with the full prompt -> 2816 tokens (all segments are on disk)
+// - evict the head cells [0, 256), save to the original session -> still 11
 //   (zero writes; the head file on disk keeps the chain alive, R2)
-// - evict part of the head cells [512, 1024) in a fresh context, save to a
+// - evict part of the head cells [128, 256) in a fresh context, save to a
 //   fresh session -> error (-1): the head segment can neither be loaded from
 //   disk (no file) nor written (incomplete cells) - the R3 head-missing rule
 static bool test_incr_partial(struct llama_model * model, const struct common_params & params) {
@@ -711,31 +711,29 @@ static bool test_incr_partial(struct llama_model * model, const struct common_pa
     }
 
     int32_t n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
-    if (n_segments != 2) {
-        LOG_ERR("\n%s: error: expected 2 segments, got %d\n", __func__, n_segments);
+    if (n_segments != 11) {
+        LOG_ERR("\n%s: error: expected 11 segments, got %d\n", __func__, n_segments);
         return false;
     }
 
-    // evict the tail of the KV cache
-    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 1024, 3000);
+    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 256, 3000);
 
     n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
-    if (n_segments != 2) {
+    if (n_segments != 11) {
         LOG_ERR("\n%s: error: expected chain to be preserved after eviction, got %d\n", __func__, n_segments);
         return false;
     }
 
     auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
-    if (n_restored != 2048) {
-        LOG_ERR("\n%s: error: expected 2048 tokens restored, got %zu\n", __func__, n_restored);
+    if (n_restored != 2816) {
+        LOG_ERR("\n%s: error: expected 2816 tokens restored, got %zu\n", __func__, n_restored);
         return false;
     }
-    // evict the whole head: the chain on disk is untouched, save is a no-op (R2)
-    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 0, 1024);
+    llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 0, 256);
 
     n_segments = llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size());
-    if (n_segments != 2) {
+    if (n_segments != 11) {
         LOG_ERR("\n%s: error: expected chain to be preserved after head eviction, got %d\n", __func__, n_segments);
         return false;
     }
@@ -748,7 +746,7 @@ static bool test_incr_partial(struct llama_model * model, const struct common_pa
     if (!decode_tokens(ctx3.get(), tokens, 0, tokens.size(), 0)) {
         return false;
     }
-    llama_memory_seq_rm(llama_get_memory(ctx3.get()), 0, 512, 1024);
+    llama_memory_seq_rm(llama_get_memory(ctx3.get()), 0, 128, 256);
 
     const std::string session_fresh = session_path("session_partial_fresh.bin");
     const int32_t n_segments_err = llama_state_seq_save_incr(ctx3.get(), session_fresh.c_str(), 0, tokens.data(), tokens.size());
@@ -762,9 +760,9 @@ static bool test_incr_partial(struct llama_model * model, const struct common_pa
 }
 
 // Test 9: GGSD corrupt / missing segment
-// - decode 2500 tokens, save -> 2 segments
-// - flip a byte in the payload of segment 1 -> restore stops at it (1024)
-// - delete segment 1 -> restore stops at the missing file (1024)
+// - decode 2500 tokens, save -> 9 segments
+// - flip a byte in the payload of segment 1 -> restore stops at it (256)
+// - delete segment 1 -> restore stops at the missing file (256)
 // - corrupt session file -> restore is unaffected (pool semantics, R1)
 static bool test_incr_corrupt(struct llama_model * model, const struct common_params & params) {
     incr_test_cleanup();
@@ -776,7 +774,7 @@ static bool test_incr_corrupt(struct llama_model * model, const struct common_pa
     if (!decode_tokens(ctx.get(), tokens, 0, tokens.size(), 0)) {
         return false;
     }
-    if (llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size()) != 2) {
+    if (llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size()) != 9) {
         return false;
     }
 
@@ -800,13 +798,13 @@ static bool test_incr_corrupt(struct llama_model * model, const struct common_pa
 
     auto ctx2 = llama_context_ptr{llama_init_from_model(model, incr_context_params(params))};
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
-    if (n_restored != 1024) {
-        LOG_ERR("\n%s: error: expected 1024 tokens restored (stop at corrupt segment), got %zu\n", __func__, n_restored);
+    if (n_restored != 256) {
+        LOG_ERR("\n%s: error: expected 256 tokens restored (stop at corrupt segment), got %zu\n", __func__, n_restored);
         return false;
     }
     // missing mid-chain segment: restore stops at the first missing file
     // (corrupt segment above was not rewritten, so segment 1 is present but
-    // bad; delete it and the verified prefix is still 1024)
+    // bad; delete it and the verified prefix is still 256)
     const std::string fname_missing = segment_file_by_index(1);
     if (fname_missing.empty()) {
         LOG_ERR("\n%s: error: segment 1 file not found\n", __func__);
@@ -815,8 +813,8 @@ static bool test_incr_corrupt(struct llama_model * model, const struct common_pa
     std::filesystem::remove(fname_missing);
 
     const size_t n_restored2 = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
-    if (n_restored2 != 1024) {
-        LOG_ERR("\n%s: error: expected 1024 tokens restored despite missing segment (pool semantics), got %zu\n", __func__, n_restored2);
+    if (n_restored2 != 256) {
+        LOG_ERR("\n%s: error: expected 256 tokens restored despite missing segment (pool semantics), got %zu\n", __func__, n_restored2);
         return false;
     }
 
@@ -827,8 +825,8 @@ static bool test_incr_corrupt(struct llama_model * model, const struct common_pa
     }
 
     const size_t n_restored3 = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0, tokens.data(), tokens.size(), 64, 0);
-    if (n_restored3 != 1024) {
-        LOG_ERR("\n%s: error: expected 1024 tokens restored despite corrupt session (pool semantics), got %zu\n", __func__, n_restored3);
+    if (n_restored3 != 256) {
+        LOG_ERR("\n%s: error: expected 256 tokens restored despite corrupt session (pool semantics), got %zu\n", __func__, n_restored3);
         return false;
     }
 
@@ -853,7 +851,7 @@ static bool test_incr_mismatch(struct llama_model * model, const struct common_p
     if (!decode_tokens(ctx_f32.get(), tokens, 0, tokens.size(), 0)) {
         return false;
     }
-    if (llama_state_seq_save_incr(ctx_f32.get(), session.c_str(), 0, tokens.data(), tokens.size()) != 2) {
+    if (llama_state_seq_save_incr(ctx_f32.get(), session.c_str(), 0, tokens.data(), tokens.size()) != 8) {
         return false;
     }
 
@@ -865,10 +863,10 @@ static bool test_incr_mismatch(struct llama_model * model, const struct common_p
         return false;
     }
 
-    // restore with the F32 cache and a shorter prompt: match is floor-aligned to 1024
+    // restore with the F32 cache and a shorter prompt: match is floor-aligned to 256
     const size_t n_restored2 = llama_state_seq_load_incr(ctx_f32.get(), session.c_str(), 0, tokens.data(), 1500, 1024, 0);
-    if (n_restored2 != 1024) {
-        LOG_ERR("\n%s: error: expected 1024 tokens restored, got %zu\n", __func__, n_restored2);
+    if (n_restored2 != 1280) {
+        LOG_ERR("\n%s: error: expected 1280 tokens restored, got %zu\n", __func__, n_restored2);
         return false;
     }
 
@@ -891,11 +889,11 @@ static bool test_incr_mismatch(struct llama_model * model, const struct common_p
 }
 
 // Test 11: GGSD differential replay
-// - decode 2500, save -> 2 segments
+// - decode 2500, save -> 9 segments
 // - fresh context decodes the first 1500 tokens, restore with
-//   n_prefix_valid = 1024 -> 2048 restored, generation matches reference
-// - delete segment 0's file, restore again with n_prefix_valid = 1024 ->
-//   still 2048 (skipped segments are never read)
+//   n_prefix_valid = 1280 -> 2304 restored, generation matches reference
+// - delete segment 0's file, restore again with n_prefix_valid = 1280 ->
+//   still 2304 (skipped segments are never read)
 // - same deletion with n_prefix_valid = 0 -> 0 restored (head missing)
 static bool test_incr_differential(struct llama_model * model, const struct common_params & params) {
     incr_test_cleanup();
@@ -907,7 +905,7 @@ static bool test_incr_differential(struct llama_model * model, const struct comm
     if (!decode_tokens(ctx.get(), tokens, 0, tokens.size(), 0)) {
         return false;
     }
-    if (llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size()) != 2) {
+    if (llama_state_seq_save_incr(ctx.get(), session.c_str(), 0, tokens.data(), tokens.size()) != 9) {
         return false;
     }
 
@@ -928,9 +926,9 @@ static bool test_incr_differential(struct llama_model * model, const struct comm
     }
 
     const size_t n_restored = llama_state_seq_load_incr(ctx2.get(), session.c_str(), 0,
-            tokens.data(), tokens.size(), 64, 1024);
-    if (n_restored != 2048) {
-        LOG_ERR("\n%s: error: expected 2048 restored (differential), got %zu\n", __func__, n_restored);
+            tokens.data(), tokens.size(), 64, 1280);
+    if (n_restored != 2304) {
+        LOG_ERR("\n%s: error: expected 2304 restored (differential), got %zu\n", __func__, n_restored);
         return false;
     }
     if (!decode_tokens(ctx2.get(), tokens, n_restored, tokens.size(), 0)) {
@@ -953,9 +951,9 @@ static bool test_incr_differential(struct llama_model * model, const struct comm
         return false;
     }
     const size_t n_restored2 = llama_state_seq_load_incr(ctx3.get(), session.c_str(), 0,
-            tokens.data(), tokens.size(), 64, 1024);
-    if (n_restored2 != 2048) {
-        LOG_ERR("\n%s: error: expected 2048 restored despite deleted head (differential), got %zu\n", __func__, n_restored2);
+            tokens.data(), tokens.size(), 64, 1280);
+    if (n_restored2 != 2304) {
+        LOG_ERR("\n%s: error: expected 2304 restored despite deleted head (differential), got %zu\n", __func__, n_restored2);
         return false;
     }
 

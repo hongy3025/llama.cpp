@@ -27,8 +27,8 @@
 namespace {
     constexpr char GGSD_MAGIC[4] = { 'G', 'G', 'S', 'D' };
 
-    constexpr uint32_t GGSD_VERSION                = 1;
-    constexpr uint32_t GGSD_SEGMENT_TOKENS         = 1024;
+    constexpr uint32_t GGSD_VERSION                = llama_ggsd::VERSION;
+    constexpr uint32_t GGSD_SEGMENT_TOKENS         = llama_ggsd::SEGMENT_TOKENS;
     constexpr size_t   GGSD_HASH_BYTES             = 16; // truncated sha256
     constexpr size_t   GGSD_HASH_HEX_LEN           = 32;
 
@@ -129,7 +129,7 @@ namespace {
         return hex;
     }
 
-    // hash chain of the first n_seg 1024-token blocks of tokens
+    // hash chain of the first n_seg segment-sized blocks of tokens
     std::vector<std::string> ggsd_hash_chain(
             const std::string & model_id,
             const std::string & kv_params,
