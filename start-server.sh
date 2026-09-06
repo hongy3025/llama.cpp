@@ -57,7 +57,7 @@ exec "$BIN" \
     --ctx-checkpoints 0 \
     --jinja \
     --reasoning off \
-    --reasoning-format none \
+    --reasoning-format deepseek \
     --reasoning-budget -1 \
     --no-context-shift \
     --no-mmproj \
