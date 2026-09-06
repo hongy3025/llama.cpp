@@ -755,6 +755,108 @@ static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ctx->dev_ptr;
 }
 
+#ifdef GGML_USE_HIP
+static constexpr size_t ggml_cuda_rocmfpx_fp6_disk_block_size = sizeof(block_rocmfp6);
+static constexpr size_t ggml_cuda_rocmfpx_fp6_expanded_block_size = sizeof(block_rocmfp6_expanded);
+
+static int8_t ggml_cuda_rocmfpx_fp6_decode_code(uint8_t code) {
+    const int8_t mag = code & 31;
+    return (code & 32) != 0 ? -(mag == 0 ? 32 : mag) : mag;
+}
+
+static uint8_t ggml_cuda_rocmfpx_fp6_encode_code(int8_t value) {
+    if (value == 0) {
+        return 0;
+    }
+    if (value == -32) {
+        return 32;
+    }
+    const uint8_t mag = (uint8_t) std::min<int>(std::abs((int) value), 31);
+    return (value < 0 ? 32 : 0) | mag;
+}
+
+static uint8_t ggml_cuda_rocmfpx_fp6_get_code(const uint8_t * qs, uint32_t idx) {
+    const uint32_t bit_pos = idx * 6;
+    const uint32_t byte_pos = bit_pos >> 3;
+    const uint32_t shift = bit_pos & 7;
+    uint32_t bits = qs[byte_pos];
+    if (byte_pos + 1 < QS_ROCMFP6) {
+        bits |= uint32_t(qs[byte_pos + 1]) << 8;
+    }
+    return (bits >> shift) & 0x3f;
+}
+
+static void ggml_cuda_rocmfpx_fp6_set_code(uint8_t * qs, uint32_t idx, uint8_t code) {
+    const uint32_t bit_pos = idx * 6;
+    const uint32_t byte_pos = bit_pos >> 3;
+    const uint32_t shift = bit_pos & 7;
+    uint32_t bits = qs[byte_pos];
+    if (byte_pos + 1 < QS_ROCMFP6) {
+        bits |= uint32_t(qs[byte_pos + 1]) << 8;
+    }
+    bits &= ~(uint32_t(0x3f) << shift);
+    bits |= uint32_t(code & 0x3f) << shift;
+    qs[byte_pos] = bits & 0xff;
+    if (byte_pos + 1 < QS_ROCMFP6) {
+        qs[byte_pos + 1] = (bits >> 8) & 0xff;
+    }
+}
+
+static void ggml_cuda_rocmfpx_fp6_expand_blocks(uint8_t * dst, const uint8_t * src, size_t nblocks) {
+    for (size_t ib = 0; ib < nblocks; ++ib) {
+        const uint8_t * s = src + ib * ggml_cuda_rocmfpx_fp6_disk_block_size;
+        uint8_t * d = dst + ib * ggml_cuda_rocmfpx_fp6_expanded_block_size;
+        for (uint32_t i = 0; i < QK_ROCMFP6; ++i) {
+            d[i] = (uint8_t) ggml_cuda_rocmfpx_fp6_decode_code(ggml_cuda_rocmfpx_fp6_get_code(s, i));
+        }
+        d[QK_ROCMFP6 + 0] = s[QS_ROCMFP6 + 0];
+        d[QK_ROCMFP6 + 1] = s[QS_ROCMFP6 + 1];
+    }
+}
+
+static void ggml_cuda_rocmfpx_fp6_pack_blocks(uint8_t * dst, const uint8_t * src, size_t nblocks) {
+    for (size_t ib = 0; ib < nblocks; ++ib) {
+        uint8_t * d = dst + ib * ggml_cuda_rocmfpx_fp6_disk_block_size;
+        const uint8_t * s = src + ib * ggml_cuda_rocmfpx_fp6_expanded_block_size;
+        memset(d, 0, QS_ROCMFP6);
+        for (uint32_t i = 0; i < QK_ROCMFP6; ++i) {
+            ggml_cuda_rocmfpx_fp6_set_code(d, i, ggml_cuda_rocmfpx_fp6_encode_code((int8_t) s[i]));
+        }
+        d[QS_ROCMFP6 + 0] = s[QK_ROCMFP6 + 0];
+        d[QS_ROCMFP6 + 1] = s[QK_ROCMFP6 + 1];
+    }
+}
+
+static bool ggml_cuda_rocmfpx_fp6_range_aligned(size_t offset, size_t size) {
+    return offset % ggml_cuda_rocmfpx_fp6_disk_block_size == 0 &&
+           size   % ggml_cuda_rocmfpx_fp6_disk_block_size == 0;
+}
+
+static size_t ggml_cuda_rocmfpx_fp6_expanded_size_from_disk(size_t size) {
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+    GGML_ASSERT(size % ggml_cuda_rocmfpx_fp6_disk_block_size == 0);
+    return (size / ggml_cuda_rocmfpx_fp6_disk_block_size) * ggml_cuda_rocmfpx_fp6_expanded_block_size;
+#else
+    return size;
+#endif
+}
+
+static size_t ggml_cuda_tensor_nbytes(const ggml_tensor * tensor) {
+    if (GGML_ROCMFP6_EXPANDED_DEVICE && tensor->type == GGML_TYPE_Q6_0_ROCMFPX) {
+        return ggml_cuda_rocmfpx_fp6_expanded_size_from_disk(ggml_nbytes(tensor));
+    }
+    return ggml_nbytes(tensor);
+}
+
+static size_t ggml_cuda_tensor_offset(const ggml_tensor * tensor, size_t packed_offset) {
+    if (GGML_ROCMFP6_EXPANDED_DEVICE && tensor->type == GGML_TYPE_Q6_0_ROCMFPX) {
+        GGML_ASSERT(packed_offset % ggml_cuda_rocmfpx_fp6_disk_block_size == 0);
+        return (packed_offset / ggml_cuda_rocmfpx_fp6_disk_block_size) * ggml_cuda_rocmfpx_fp6_expanded_block_size;
+    }
+    return packed_offset;
+}
+#endif // GGML_USE_HIP
+
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
@@ -5150,6 +5252,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+                    case GGML_TYPE_Q4_0_ROCMI4:
+                    case GGML_TYPE_Q3_0_ROCMFPX:
+                    case GGML_TYPE_Q2_0_ROCMFPX:
+                    case GGML_TYPE_Q5_0_ROCMFPX:
+                    case GGML_TYPE_Q6_0_ROCMFPX:
+                    case GGML_TYPE_Q7_0_ROCMFPX:
+                    case GGML_TYPE_Q8_0_ROCMFPX:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
@@ -5201,6 +5312,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_Q2_0_ROCMFPX:
+                    case GGML_TYPE_Q3_0_ROCMFPX:
+                    case GGML_TYPE_Q5_0_ROCMFPX:
+                    case GGML_TYPE_Q6_0_ROCMFPX:
+                    case GGML_TYPE_Q7_0_ROCMFPX:
+                    case GGML_TYPE_Q8_0_ROCMFPX:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
@@ -5262,6 +5379,81 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 if (src0_type == GGML_TYPE_Q4_1 && src1_type == GGML_TYPE_F32) {
                     return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_0_ROCMFP4 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_0_ROCMFP4_FAST && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0_ROCMFP4) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_Q4_0_ROCMFP4) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_Q4_0_ROCMFP4) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q3_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_Q3_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_Q3_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q3_0_ROCMFPX && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q6_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_Q6_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_Q6_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q6_0_ROCMFPX && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q8_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_Q8_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_Q8_0_ROCMFPX) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q8_0_ROCMFPX && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_0_ROCMFP4 && src1_type == GGML_TYPE_Q4_0_ROCMFP4) {
+                    return op->src[0]->ne[0] % QK_ROCMFP4 == 0;
+                }
+                if (src0_type == GGML_TYPE_Q4_0_ROCMFP4_FAST && src1_type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    return op->src[0]->ne[0] % QK_ROCMFP4 == 0;
+                }
+                if (src0_type == GGML_TYPE_Q3_0_ROCMFPX && src1_type == GGML_TYPE_Q3_0_ROCMFPX) {
+                    return op->src[0]->ne[0] % QK_ROCMFP3 == 0;
+                }
+                if (src0_type == GGML_TYPE_Q6_0_ROCMFPX && src1_type == GGML_TYPE_Q6_0_ROCMFPX) {
+                    return op->src[0]->ne[0] % QK_ROCMFP6 == 0;
+                }
+                if (src0_type == GGML_TYPE_Q8_0_ROCMFPX && src1_type == GGML_TYPE_Q8_0_ROCMFPX) {
+                    return op->src[0]->ne[0] % QK_ROCMFP8 == 0;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q5_0) {
                     return true;
@@ -5645,6 +5837,17 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
     #ifdef GGML_CUDA_FA_ALL_QUANTS
         features.push_back({ "FA_ALL_QUANTS", "1" });
+    #endif
+
+    #if defined(GGML_ROCMI4_W4A4) && GGML_ROCMI4_W4A4
+        // W4A4 requantizes MMQ activations to IU4, so tests need a feature flag for the approximate path.
+        const auto & info = ggml_cuda_info();
+        for (int id = 0; id < info.device_count; ++id) {
+            if (GGML_CUDA_CC_IS_GFX1151(info.devices[id].cc)) {
+                features.push_back({ "ROCMI4_W4A4", "1" });
+                break;
+            }
+        }
     #endif
 
     {

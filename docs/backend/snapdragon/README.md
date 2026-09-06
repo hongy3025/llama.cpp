@@ -265,4 +265,3 @@ ggml-hex: new session: HTP0 : session-id 0 domain-id 3 uri file:///libggml-htp-v
 
       `GGML_HEXAGON_OPFILTER="FLASH_ATTN_EXT" ./scripts/snapdragon/run.py --target adb -- llama-cli ...` - Disable Flash Attention on Hexagon (falls back to CPU or GPU)
       `GGML_HEXAGON_OPFILTER="ADD\|SUB" ./scripts/snapdragon/run.py --target adb -- llama-cli ...` - Disable ADD and SUB on Hexagon (fall back to CPU or GPU)
-

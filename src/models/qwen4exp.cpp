@@ -168,20 +168,28 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     // flat [ple_head_dim, n_rows] gather target
     if (hparams.ple_n_heads > 0) {
-        // the head ranges are what the gather indexes, so they set the minimum row count
+        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
         int64_t ple_rows = 0;
-        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
-            ple_rows = std::max(ple_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
+        if (ml.files.empty()) {
+            // llama_model_init_from_user() carries tensor overrides directly in
+            // the caller-owned GGUF context and intentionally has no file-backed
+            // weight map.
+            const int64_t tid = gguf_find_tensor(ml.metadata, ple_name.c_str());
+            if (tid < 0) {
+                throw std::runtime_error(format("PLE tensor '%s' not found", ple_name.c_str()));
+            }
+            ple_rows = gguf_get_tensor_ne(ml.metadata, tid)[1];
+        } else {
+            // A file-backed PLE table may live in any shard, so use the unified
+            // weight map instead of looking only in the first GGUF context.
+            ple_rows = ml.require_tensor_meta(ple_name)->ne[1];
         }
 
-        // the converter pads the table; a model synthesised from metadata has no tensor to ask
-        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
-            if (ple_w->tensor->ne[1] < ple_rows) {
-                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
-                                                ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
+        // sanity check
+        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+            if ((int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h] > ple_rows) {
+                throw std::runtime_error(format("PLE head %u range exceeds the %" PRId64 " table rows", h, ple_rows));
             }
-            ple_rows = ple_w->tensor->ne[1];
         }
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),

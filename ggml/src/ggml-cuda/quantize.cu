@@ -454,7 +454,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool i4_grid = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -512,13 +512,28 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    const float d_inv = 127.0f / amax;
+    const float d_inv = i4_grid
+        ? (amax > 0.0f ? 7.0f / amax : 0.0f)
+        : 127.0f / amax;
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
-    const float d = 1.0f / d_inv;
+
+    int packed_i4 = 0;
+    if constexpr (i4_grid) {
+        const int c0 = max(-8, min(7, int(q.x)));
+        const int c1 = max(-8, min(7, int(q.y)));
+        const int c2 = max(-8, min(7, int(q.z)));
+        const int c3 = max(-8, min(7, int(q.w)));
+        const int lo4 = (c0 & 0xF) | ((c1 & 0xF) << 8) | ((c2 & 0xF) << 16) | ((c3 & 0xF) << 24);
+        const int hi4 = __shfl_xor_sync(0xFFFFFFFF, lo4, 1, WARP_SIZE);
+        packed_i4 = lo4 | (hi4 << 4);
+    }
+
+    // IU4 accumulators are interpreted in units of 16*c by the W4A4 path.
+    const float d = i4_grid ? (amax > 0.0f ? amax / (7.0f * 16.0f) : 0.0f) : 1.0f / d_inv;
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
@@ -533,9 +548,16 @@ static __global__ void quantize_mmq_q8_1(
             ib = ib0 + k_block*ne1 + blockIdx.x;
         }
 
-        // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
-        char4 * yqs4 = (char4 *) y[ib].qs;
-        yqs4[iqs/4] = q;
+        if constexpr (i4_grid) {
+            if (iqs % 8 == 0) {
+                int * yqs_i = (int *) y[ib].qs;
+                yqs_i[iqs/8] = packed_i4;
+            }
+        } else {
+            // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
+            char4 * yqs4 = (char4 *) y[ib].qs;
+            yqs4[iqs/4] = q;
+        }
 
         if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
             if (iqs % 16 == 0 && iqs < 96) {
@@ -583,6 +605,15 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+#if GGML_ROCMI4_W4A4
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    // Native IU4 W4A4: activations go onto the 4-bit grid up front.
+    if (type_src0 == GGML_TYPE_Q4_0_ROCMI4 && GGML_CUDA_CC_IS_GFX1151(cc)) {
+        quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true>
+            <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+        return;
+    }
+#endif
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>

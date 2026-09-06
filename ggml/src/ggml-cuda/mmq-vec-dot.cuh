@@ -1238,3 +1238,71 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+
+#if GGML_ROCMI4_W4A4
+// Native packed IU4/W4A4 dot product for gfx1151.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rocmi4_w4a4_wmma(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(__gfx1151__)
+    constexpr data_layout input_layout = get_input_data_layout();
+    typedef tile<16,  4, int, input_layout>        tile_A;  // 4 packed dwords == 32 nibbles == K=32
+    typedef tile<16,  4, int, input_layout>        tile_B;
+    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
+
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int ntx = rows_per_warp/tile_C::I;
+
+    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + MMQ_TILE_NE_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    // k00/k01 are in int8-expanded dword units (4 elements each); the packed
+    // weight tile holds 8 elements per dword, hence the /2.
+    // NOTE: deliberately not unrolled -- the int8 path does the same. Unrolling
+    // this loop multiplies the live tile_A/tile_B state and spills VGPRs hard.
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+        const int k0 = k00 + k01;
+        const int kp = k0 / 2;
+
+        tile_A A[ntx];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + kp, sram_stride);
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+            tile_B B;
+            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01/2, MMQ_TILE_Y_K);
+
+            const int j = j0 + tile_C::get_j(0);
+            const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma_iu4<true>(C, A[n], B);
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                    const float dA = x_df[i*sram_stride + k0/QI8_0];
+                    const int acc = C.x[l]*16;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += acc*dA*dB;
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y, sum, k00);
+    NO_DEVICE_CODE;
+#endif
+}
+#endif // GGML_ROCMI4_W4A4
+
