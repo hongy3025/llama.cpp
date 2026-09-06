@@ -1589,7 +1589,7 @@ private:
             return;
         }
 
-        if (slot.prompt.tokens.has_mtmd) {
+        if (slot.task->tokens.has_media()) {
             return;
         }
 
@@ -1712,7 +1712,7 @@ private:
             // switch reuses the partial prefix and never consults the segment pool
             const bool do_ggsd = prompt_cache &&
                 params_base.prompt_cache_ssd && task.type == SERVER_TASK_TYPE_COMPLETION &&
-                !task.tokens.has_mtmd && !task.tokens.get_tokens().empty();
+                !task.tokens.has_media() && !task.tokens.get_tokens().empty();
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");

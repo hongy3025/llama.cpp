@@ -219,6 +219,7 @@ public:
     size_t size() const { return tokens.size(); }
 
     bool empty() const { return tokens.empty(); }
+    bool has_media() const { return !map_idx_to_media.empty(); }
 
     void clear() {
         map_idx_to_media.clear();
