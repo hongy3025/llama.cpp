@@ -2,7 +2,8 @@
 # llama-server launcher with GGSD prompt-cache-ssd enabled
 set -euo pipefail
 
-MODEL="/models/LuffyTheFox/Hermes3.6-35B-A3B/Hermes3.6-35B-A3B-Uncensored-Genesis-V9-MTP-APEX.gguf"
+MODEL="/models/qwen3.8/Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf"
+DRAFT="/models/qwen3.8/mtp-Qwen3.8-27B-Q4_0.gguf"
 HOST="0.0.0.0"
 PORT=8080
 SAVE_DIR="$(dirname "$0")/saves"
@@ -13,8 +14,13 @@ if [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
+if [ ! -f "$DRAFT" ]; then
+    echo "error: MTP model not found: $DRAFT" >&2
+    exit 1
+fi
+
 if [ ! -x "$BIN" ]; then
-    echo "error: llama-server not found: $BIN (build it first: cmake --build build-rocm --target llama-server)" >&2
+    echo "error: llama-server not found: $BIN (build it first: ./build_rocm.sh)" >&2
     exit 1
 fi
 
@@ -25,8 +31,8 @@ mkdir -p "$SAVE_DIR"
 #   --prompt-cache-ssd-margin N      default 256)
 exec "$BIN" \
     -m "$MODEL" \
+    -md "$DRAFT" \
     --n-gpu-layers all \
-    --mmproj /models/LuffyTheFox/Hermes3.6-35B-A3B/mmproj-Hermes3.6-35B-A3B-Uncensored-Genesis-F16.gguf \
     --host "$HOST" \
     --port "$PORT" \
     --slot-save-path "$SAVE_DIR" \
