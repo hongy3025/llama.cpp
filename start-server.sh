@@ -1,52 +1,81 @@
 #!/usr/bin/env bash
-# llama-server launcher with GGSD prompt-cache-ssd enabled
+# ROCmFPX dense-Qwen MTP decode-fast profile for Strix Halo / ROCm0.
 set -euo pipefail
 
-MODEL="/models/LuffyTheFox/Hermes3.6-35B-A3B/Hermes3.6-35B-A3B-Uncensored-Genesis-V9-MTP-APEX.gguf"
-HOST="0.0.0.0"
-PORT=8080
-SAVE_DIR="$(dirname "$0")/saves"
+MODEL="${MODEL:-/models/qwen3.8/Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf}"
+DRAFT="${DRAFT:-/models/qwen3.8/mtp-Qwen3.8-27B-Q4_0.gguf}"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8080}"
 BIN="$(dirname "$0")/build-rocm/bin/llama-server"
+
+# Match q38rocm's supported Strix Halo HIP runtime profile without changing
+# machine-wide DPM, THP, or GTT settings.
+export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.5.1}"
+export GGML_HIP_ENABLE_UNIFIED_MEMORY="${GGML_HIP_ENABLE_UNIFIED_MEMORY:-1}"
+export ROCM_FLUSH_ACCEPT="${ROCM_FLUSH_ACCEPT:-1}"
 
 if [ ! -f "$MODEL" ]; then
     echo "error: model not found: $MODEL" >&2
     exit 1
 fi
 
-if [ ! -x "$BIN" ]; then
-    echo "error: llama-server not found: $BIN (build it first: cmake --build build-rocm --target llama-server)" >&2
+if [ ! -f "$DRAFT" ]; then
+    echo "error: MTP model not found: $DRAFT" >&2
     exit 1
 fi
 
-mkdir -p "$SAVE_DIR"
+if [ ! -x "$BIN" ]; then
+    echo "error: llama-server not found: $BIN (build it first: ./build_rocm.sh)" >&2
+    exit 1
+fi
 
-# --prompt-cache-ssd: GGSD autoload + autosave.
-#   GGSD segments are 256 tokens; the thresholds below are tunable.
+# q38rocm dense-Qwen MTP profile: one ROCm slot, q8 accepted KV, q4 draft KV,
+# MTP n=4/p=0.75, 512/512 batching, deterministic sampling, and no context
+# shift. This target uses a separate NextN MTP draft, so draft offload is
+# explicit even though the target GGUF has no embedded MTP tensors.
 exec "$BIN" \
     -m "$MODEL" \
+    -md "$DRAFT" \
+    -dev ROCm0 \
+    --spec-draft-device ROCm0 \
     --n-gpu-layers all \
-    --mmproj /models/LuffyTheFox/Hermes3.6-35B-A3B/mmproj-Hermes3.6-35B-A3B-Uncensored-Genesis-F16.gguf \
+    --spec-draft-ngl all \
     --host "$HOST" \
     --port "$PORT" \
-    --slot-save-path "$SAVE_DIR" \
-    --prompt-cache-ssd \
-    --prompt-cache-ssd-min-prefix 256 \
-    --prompt-cache-ssd-margin 64 \
-    -np 4 \
-    --kv-unified \
-    --ctx-size 131072 \
-    --cache-ram 8192 \
+    -np 1 \
+    --ctx-size 262144 \
+    -b 512 \
+    -ub 512 \
+    -t 16 \
+    -tb 32 \
+    --poll 100 \
     --flash-attn on \
-    --load-mode dio \
-    --ctx-checkpoints 8 \
-    --cont-batching \
-    --spec-type ngram-map-k4v,draft-mtp \
-    --spec-draft-type-k q8_0 \
-    --spec-draft-type-v q8_0 \
-    --spec-draft-n-max 3 \
-    --spec-draft-threads 4 \
-    --spec-draft-threads-batch 4 \
-    --spec-ngram-map-k4v-size-n 32 \
-    --spec-ngram-map-k4v-size-m 48 \
-    --spec-ngram-map-k4v-min-hits 1 \
+    --mmap \
+    --cache-type-k q8_0 \
+    --cache-type-v q8_0 \
+    --cache-ram 8192 \
+    --ctx-checkpoints 0 \
+    --jinja \
+    --reasoning off \
+    --reasoning-format none \
+    --reasoning-budget -1 \
+    --no-context-shift \
+    --no-mmproj \
+    --temp 0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --seed 123 \
+    --spec-type draft-mtp \
+    --spec-draft-type-k q4_0 \
+    --spec-draft-type-v q4_0 \
+    --spec-draft-n-max 4 \
+    --spec-draft-n-min 0 \
+    --spec-draft-p-min 0.75 \
+    --spec-draft-p-split 0.10 \
+    --spec-draft-threads 16 \
+    --spec-draft-threads-batch 32 \
+    --no-spec-draft-backend-sampling \
+    --spec-draft-poll 1 \
+    --spec-draft-poll-batch 1 \
+    --metrics \
     "$@"
