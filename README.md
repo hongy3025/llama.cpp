@@ -1,6 +1,36 @@
-# llama.cpp
+<div align="center">
+
+**[English](README.md) | [简体中文](README.zh-CN.md)**
+
+</div>
+
+# llama.cpp (ROCmFP4 port)
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+
+> [!NOTE]
+> **What this repository is:** a port of the official
+> [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that adds the
+> ROCmFP4 (STRIX) GGUF quantization format, built on top of the official
+> DFlash2 speculative-decoding branch
+> ([PR #27342](https://github.com/ggml-org/llama.cpp/pull/27342) by SubSir).
+> Everything else tracks upstream (MIT).
+>
+> **Fork additions** (details, rationale and measured numbers in [docs/rocmfp4.md](docs/rocmfp4.md)):
+>
+> - **ROCmFP4 (STRIX) GGUF quantization** — `Q4_0_ROCMFP4` / `Q4_0_ROCMFP4_FAST`
+>   (type 100/101): 32-value blocks, split-nibble layout (low nibbles = values
+>   0..15, high nibbles = values 16..31), Codebook10 values, half-scale UE4M3
+>   scales. Full CPU + HIP kernels: MMVQ, MMQ (incl. RDNA3 WMMA path),
+>   dequantization, `MUL_MAT_ID`. Without this port, official llama.cpp cannot
+>   load ROCmFP4 models at all.
+> - **Reference serving setup for RX 7900 XTX** — [`scripts/serve-dflash2.sh`](scripts/serve-dflash2.sh):
+>   fp4 weights + q4_0 KV cache (`LLAMA_ATTN_ROT_DISABLE=1`), DFlash2 draft
+>   (n5/p0.4) stacked with ngram-map-k4v (n12/m48), 256K context at 24 GiB
+>   (`--no-kv-unified --ctx-checkpoints 2 --cache-ram 4096`).
+>   Measured on Qwen3.8-27B: 41 tok/s fp4 baseline → 68 (reasoning content) →
+>   98 tok/s (repetitive content, ngram hits). Speculative acceptance is
+>   content-driven — creative prose stays at 30-35 on every stack.
 
 <div align="center">
 
@@ -16,6 +46,47 @@
 [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
 
 </div>
+
+## ROCmFP4 serving (measured on RX 7900 XTX / gfx1100)
+
+```bash
+cmake -B build-rocmfp4 -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100
+cmake --build build-rocmfp4 -j
+bash scripts/serve-dflash2.sh
+```
+
+### Complete launch command (what the script expands to)
+
+```bash
+LLAMA_ATTN_ROT_DISABLE=1 ./build-rocmfp4/bin/llama-server \
+  -m  models/Qwen3.8-27B-heretic-ara.ROCmFP4-STRIX.gguf \   # main model (ROCmFP4/STRIX)
+  -md models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \              # DFlash2 draft model
+  --mmproj models/mmproj-Qwen3.8-27B-Q8_0.gguf \            # vision encoder (drop this line to disable)
+  --spec-type ngram-map-k4v,draft-dflash \                  # stacked speculators, applied in order
+  --spec-ngram-map-k4v-size-n 12 \                          # n-gram lookup key length
+  --spec-ngram-map-k4v-size-m 48 \                          # max draft tokens on an n-gram hit
+  --spec-ngram-map-k4v-min-hits 1 \                         # minimum occurrences for a hit
+  --spec-draft-n-max 5 \                                    # DFlash2 draft depth (measured optimum)
+  --spec-draft-p-min 0.4 \                                  # draft confidence cutoff (measured optimum)
+  -ctk q4_0 -ctv q4_0 \                                     # 4-bit KV cache (~14 GiB saved @256K)
+  -ngl 99 -ngld 99 \                                        # full offload: target / draft
+  -c 262144 \                                               # 256K context
+  -b 2048 -ub 512 \                                         # logical/physical batch, bounds prefill buffers
+  -fa on \                                                  # fused attention kernels
+  --jinja \                                                 # model's own chat template
+  --no-kv-unified \                                         # prevents full-history re-prefill on hybrid archs
+  --parallel 1 \                                            # single slot (pairs with the flag above)
+  --ctx-checkpoints 2 \                                     # spec-decode rollback snapshots (default 32 ≈ 10 GiB)
+  --cache-ram 4096 \                                        # spill prompt cache entries to host RAM
+  --no-warmup \                                             # skip warm-up pass (VRAM is nearly full)
+  --host 0.0.0.0 --port 1234                                # listen address and port
+```
+
+> `LLAMA_ATTN_ROT_DISABLE=1` is required only with a quantized KV cache
+> (`-ctk/-ctv` not f16) on HIP: the hybrid-architecture cache path does not
+> implement rotated KV and will crash without it. Do not set it for f16 KV.
+
+Per-flag rationale and measured tuning sweeps: [docs/rocmfp4.md](docs/rocmfp4.md).
 
 ## Quick start
 
