@@ -29,10 +29,11 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-# q38rocm dense-Qwen MTP profile: one ROCm slot, q8 accepted KV, q4 draft KV,
-# MTP n=4/p=0.75, 512/512 batching, deterministic sampling, and no context
-# shift. This target uses a separate NextN MTP draft, so draft offload is
-# explicit even though the target GGUF has no embedded MTP tensors.
+# q38rocm dense-Qwen MTP profile with asymmetric TurboQuant KV:
+# target K=q8_0, V=turbo4; independent draft K=q8_0, V=turbo4.
+# TurboQuant is a runtime KV-cache format, not a model-weight format.
+# Boundary protection can be enabled externally with:
+# LLAMA_KV_TURBO_BOUNDARY_LAYERS=2 LLAMA_KV_TURBO_BOUNDARY_V=1
 exec "$BIN" \
     -m "$MODEL" \
     -md "$DRAFT" \
@@ -52,7 +53,7 @@ exec "$BIN" \
     --flash-attn on \
     --mmap \
     --cache-type-k q8_0 \
-    --cache-type-v q8_0 \
+    --cache-type-v turbo4 \
     --cache-ram 8192 \
     --ctx-checkpoints 0 \
     --jinja \
@@ -66,8 +67,8 @@ exec "$BIN" \
     --top-k 20 \
     --seed 123 \
     --spec-type draft-mtp \
-    --spec-draft-type-k q4_0 \
-    --spec-draft-type-v q4_0 \
+    --spec-draft-type-k q8_0 \
+    --spec-draft-type-v turbo4 \
     --spec-draft-n-max 4 \
     --spec-draft-n-min 0 \
     --spec-draft-p-min 0.75 \
