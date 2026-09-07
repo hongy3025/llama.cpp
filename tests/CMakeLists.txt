@@ -330,6 +330,8 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+    llama_build(test-turboquant.cpp)
+    llama_test(test-turboquant)
 endif()
 
 add_library(rocmfpx-test-plugin MODULE rocmfpx-test-plugin.c)

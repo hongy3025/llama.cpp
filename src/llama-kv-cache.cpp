@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -18,6 +18,24 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static bool ggml_is_turbo_type(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
+
+static uint32_t llama_env_u32(const char * name, uint32_t default_value) {
+    const char * value = getenv(name);
+    if (!value) {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value) {
+        return default_value;
+    }
+
+    return (uint32_t) parsed;
+}
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -162,6 +180,20 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    const bool type_k_turbo = ggml_is_turbo_type(type_k);
+    const bool type_v_turbo = ggml_is_turbo_type(type_v);
+    const uint32_t turbo_boundary_layers = llama_env_u32("LLAMA_KV_TURBO_BOUNDARY_LAYERS", 0);
+    const bool protect_turbo_boundary_k = turbo_boundary_layers > 0 && type_k_turbo;
+    const bool protect_turbo_boundary_v = turbo_boundary_layers > 0 && type_v_turbo &&
+        llama_env_u32("LLAMA_KV_TURBO_BOUNDARY_V", 0) > 0;
+
+    if (protect_turbo_boundary_k || protect_turbo_boundary_v) {
+        LLAMA_LOG_WARN("%s: TurboQuant boundary protection enabled: first/last %u layers use q8_0 for%s%s cache\n",
+                __func__, turbo_boundary_layers,
+                protect_turbo_boundary_k ? " K" : "",
+                protect_turbo_boundary_v ? " V" : "");
+    }
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -213,12 +245,6 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
-            auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
-
-            dev_name = ggml_backend_dev_name(dev);
-        }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
@@ -230,8 +256,26 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        const bool is_turbo_boundary = turbo_boundary_layers > 0 &&
+                (il < turbo_boundary_layers || il + turbo_boundary_layers >= n_layer);
+        const ggml_type type_k_layer = is_turbo_boundary && type_k_turbo ? GGML_TYPE_Q8_0 : type_k;
+        const ggml_type type_v_layer = is_turbo_boundary && protect_turbo_boundary_v ? GGML_TYPE_Q8_0 : type_v;
+
+        if (type_k_layer == GGML_TYPE_TURBO3_0 || type_k_layer == GGML_TYPE_TURBO4_0) {
+            const uint32_t n_embd_head_k = hparams.n_embd_head_k(il);
+            if (n_embd_head_k != 128 && n_embd_head_k != 256) {
+                throw std::runtime_error("turbo types require head_dim=128 or 256");
+            }
+        }
+        if (type_v_layer == GGML_TYPE_TURBO3_0 || type_v_layer == GGML_TYPE_TURBO4_0) {
+            const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
+            if (n_embd_head_v != 128 && n_embd_head_v != 256) {
+                throw std::runtime_error("turbo types require head_dim=128 or 256");
+            }
+        }
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k_layer, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_layer, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
@@ -320,12 +364,14 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k =
             !attn_rot_disable &&
+            !type_k_turbo &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
+        if (!type_k_turbo &&
+                (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
@@ -333,6 +379,7 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_v =
             !attn_rot_disable &&
+            !type_v_turbo &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
             hparams.n_embd_head_v() % 64 == 0;

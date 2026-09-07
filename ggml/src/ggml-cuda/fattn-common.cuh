@@ -44,6 +44,11 @@ typedef void (* fattn_kernel_t)(
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
+#ifdef GGML_USE_HIP
+bool ggml_cuda_fattn_kv_batched(
+    ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel,
+    int nwarps, size_t nbytes_shared, int warp_size, int ncols1, int ncols2);
+#endif
 
 struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t K;
@@ -1554,7 +1559,6 @@ static __global__ void flash_attn_combine_results(
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
-
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
@@ -1562,7 +1566,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const bool allow_kv_batching = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1591,6 +1595,14 @@ void launch_fattn(
     const int id  = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
+#ifdef GGML_USE_HIP
+    if (allow_kv_batching && ggml_cuda_fattn_kv_batched(
+            ctx, dst, fattn_kernel, nwarps, nbytes_shared, warp_size, ncols1, ncols2)) {
+        return;
+    }
+#else
+    GGML_UNUSED(allow_kv_batching);
+#endif
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
