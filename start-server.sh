@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SAVE_DIR="$(dirname "$0")/saves"
+mkdir -p "$SAVE_DIR"
+
 HSA_OVERRIDE_GFX_VERSION=11.5.1 \
     GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
     ROCM_FLUSH_ACCEPT=1 \
@@ -19,6 +22,10 @@ HSA_OVERRIDE_GFX_VERSION=11.5.1 \
     --cont-batching \
     --kv-unified \
     --cache-prompt \
+    --slot-save-path "$SAVE_DIR" \
+    --prompt-cache-ssd \
+    --prompt-cache-ssd-min-prefix 256 \
+    --prompt-cache-ssd-margin 64 \
     --ctx-checkpoints 8 \
     --checkpoint-min-step 4096 \
     --cache-ram 32768 \
