@@ -773,8 +773,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
+#ifdef GGML_USE_HIP
+    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 &&
+                                       (K->ne[1] % FATTN_KQ_STRIDE == 0 || Q->ne[1] <= 8);
+#else
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+#endif
 
+#ifdef GGML_USE_HIP
+    // ROCm MTP decode can produce short, non-256-aligned KV lengths. The
+    // tile dispatcher has no safe small-batch path for those shapes.
+    if (can_use_vector_kernel && Q->ne[1] <= 8) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+#endif
     const bool is_rocmfp_family = K->type == GGML_TYPE_Q4_0_ROCMFP4 ||
                                   K->type == GGML_TYPE_Q4_0_ROCMFP4_FAST ||
                                   K->type == GGML_TYPE_Q3_0_ROCMFPX ||
