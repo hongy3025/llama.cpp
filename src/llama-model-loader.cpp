@@ -791,10 +791,11 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
-            case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
-            case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
-            case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
-            case GGML_TYPE_Q2_0_ROCMFPX: ftype = LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX; break;
+            case GGML_TYPE_NVFP4:                 ftype = LLAMA_FTYPE_MOSTLY_NVFP4; break;
+            case GGML_TYPE_Q4_0_ROCMFP4:          ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4; break;
+            case GGML_TYPE_Q4_0_ROCMFP4_FAST:     ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST; break;
+            case GGML_TYPE_Q1_0:                  ftype = LLAMA_FTYPE_MOSTLY_Q1_0; break;
+            case GGML_TYPE_Q2_0:                  ftype = LLAMA_FTYPE_MOSTLY_Q2_0; break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
