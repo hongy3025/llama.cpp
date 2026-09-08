@@ -9,7 +9,7 @@ HSA_OVERRIDE_GFX_VERSION=11.5.1 \
     --device ROCm0 \
     --gpu-layers all \
     --flash-attn on \
-    --parallel 1 \
+    --parallel 2 \
     --ctx-size 131072 \
     --batch-size 2048 \
     --ubatch-size 1024 \
@@ -22,9 +22,12 @@ HSA_OVERRIDE_GFX_VERSION=11.5.1 \
     --ctx-checkpoints 8 \
     --checkpoint-min-step 4096 \
     --cache-ram 32768 \
-    --spec-type draft-mtp \
-    --spec-draft-n-max 4 \
+    --spec-type ngram-map-k4v,draft-mtp \
+    --spec-draft-n-max 2 \
     --spec-draft-p-min 0.0 \
+    --spec-ngram-map-k4v-size-n 32 \
+    --spec-ngram-map-k4v-size-m 48 \
+    --spec-ngram-map-k4v-min-hits 1 \
     --temperature 0.0 \
     --repeat-penalty 1.05 \
     --reasoning auto \
