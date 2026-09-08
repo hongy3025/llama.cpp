@@ -155,6 +155,39 @@ static __device__ uint8_t sr_nearest_codebook(float val, const float *codebook, 
     }
     return best_idx;
 }
+// sr_codebook_4bit is sorted.  The generic nearest-neighbour loop does
+// fifteen absolute-difference comparisons for every cache element; the
+// equivalent binary decision tree needs four ordered comparisons.  Keep
+// equality on the lower centroid to match sr_nearest_codebook().
+static __device__ __forceinline__ uint8_t sr_nearest_codebook_4bit(float val) {
+    const float * const c = sr_codebook_4bit;
+
+    if (val <= 0.5f*(c[7] + c[8])) {
+        if (val <= 0.5f*(c[3] + c[4])) {
+            if (val <= 0.5f*(c[1] + c[2])) {
+                return val <= 0.5f*(c[0] + c[1]) ? 0 : 1;
+            }
+            return val <= 0.5f*(c[2] + c[3]) ? 2 : 3;
+        }
+        if (val <= 0.5f*(c[5] + c[6])) {
+            return val <= 0.5f*(c[4] + c[5]) ? 4 : 5;
+        }
+        return val <= 0.5f*(c[6] + c[7]) ? 6 : 7;
+    }
+
+    if (val <= 0.5f*(c[11] + c[12])) {
+        if (val <= 0.5f*(c[9] + c[10])) {
+            return val <= 0.5f*(c[8] + c[9]) ? 8 : 9;
+        }
+        return val <= 0.5f*(c[10] + c[11]) ? 10 : 11;
+    }
+
+    if (val <= 0.5f*(c[13] + c[14])) {
+        return val <= 0.5f*(c[12] + c[13]) ? 12 : 13;
+    }
+    return val <= 0.5f*(c[14] + c[15]) ? 14 : 15;
+}
+
 
 // Turbo3 set-rows kernel: processes 128-element chunks with FWHT
 template <typename idx_t>
@@ -335,9 +368,9 @@ static __global__ void k_set_rows_turbo4(
 
     if (chunk_global >= ne_total_chunks) return;
 
-    // Map the global chunk index to i00 (element offset within a row) + row indices
+    // Map the global chunk index to i00 (element offset within a row) + row indices.
     const int64_t elem_base = chunk_global * TURBO_HEAD_DIM_SR;
-    uint32_t tmp = (uint32_t)elem_base;
+    uint32_t tmp = (uint32_t) elem_base;
     uint2 div_mod;
 
     div_mod = fast_div_modulo(tmp, ne00_fd);
@@ -352,17 +385,15 @@ static __global__ void k_set_rows_turbo4(
     const int64_t i02 = div_mod.y;
     const int64_t i03 = div_mod.x;
 
-    const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
-    const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
     const int64_t i10 = i01;
-
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
 
     const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     const float val = src0_row[i00 + tid];
     smem[tid] = val;
 
-    // Step 1: Compute L2 norm via parallel reduction
     reduction[tid] = val * val;
     __syncthreads();
 
@@ -373,56 +404,46 @@ static __global__ void k_set_rows_turbo4(
         __syncthreads();
     }
 
-    float norm = sqrtf(reduction[0]);
-    float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+    const float norm = sqrtf(reduction[0]);
+    const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
 
-    // Step 2: Normalize
     smem[tid] *= inv_norm;
     __syncthreads();
 
-    // Step 3: FWHT butterfly stages (7 stages for n=128)
     for (int h = 1; h < TURBO_HEAD_DIM_SR; h *= 2) {
         if (tid < 64) {
-            int group = tid / h;
-            int pos = tid % h;
-            int i = group * h * 2 + pos;
-            float a = smem[i];
-            float b = smem[i + h];
+            const int group = tid / h;
+            const int pos = tid % h;
+            const int i = group * h * 2 + pos;
+            const float a = smem[i];
+            const float b = smem[i + h];
             smem[i]     = a + b;
             smem[i + h] = a - b;
         }
         __syncthreads();
     }
 
-    // Apply 1/sqrt(128) normalization
     const float fwht_scale = 0.08838834764831844f;
     smem[tid] *= fwht_scale;
     __syncthreads();
 
-    // Step 4: Scalar quantize and pack into turbo4 blocks
-    uint8_t my_idx = sr_nearest_codebook(smem[tid], sr_codebook_4bit, 16);
-
-    // Collect indices in shared memory
-    ((uint8_t *)reduction)[tid] = my_idx;
+    const uint8_t my_idx = sr_nearest_codebook_4bit(smem[tid]);
+    ((uint8_t *) reduction)[tid] = my_idx;
     __syncthreads();
 
-    // Compute destination block pointer
-    block_turbo4_0 * dst_row_ptr = (block_turbo4_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
+    block_turbo4_0 * dst_row_ptr = (block_turbo4_0 *) ((char *) dst + dst_row*s1 + i02*s2 + i03*s3);
     const int64_t dst_block_base = i00 / TURBO4_BLOCK_SIZE;
 
-    // Only 4 threads (one per block) do the packing
-    if (tid < TURBO_BLOCKS_PER_CHUNK_SR) {
-        const int blk = tid;
+    if (tid < TURBO_HEAD_DIM_SR/2) {
+        const int blk = tid / (TURBO4_BLOCK_SIZE/2);
+        const int j   = tid % (TURBO4_BLOCK_SIZE/2);
         block_turbo4_0 * dst_block = dst_row_ptr + dst_block_base + blk;
-        const uint8_t * indices = ((const uint8_t *)reduction) + blk * 32;
+        const uint8_t * indices = ((const uint8_t *) reduction) + blk*TURBO4_BLOCK_SIZE;
 
-        // Store norm
-        dst_block->d = __float2half(norm);
-
-        // Pack 32 x 4-bit indices into 16 bytes
-        for (int j = 0; j < TURBO4_BLOCK_SIZE / 2; j++) {
-            dst_block->qs[j] = (indices[2*j] & 0x0F) | ((indices[2*j + 1] & 0x0F) << 4);
+        if (j == 0) {
+            dst_block->d = __float2half(norm);
         }
+        dst_block->qs[j] = (indices[2*j] & 0x0F) | ((indices[2*j + 1] & 0x0F) << 4);
     }
 
     GGML_UNUSED(ne10);
@@ -483,7 +504,7 @@ static void set_rows_cuda_turbo4(
 
     GGML_ASSERT(ne00 % TURBO_HEAD_DIM_SR == 0);
     const int64_t ne_total_chunks = (ne00 * ne01 * ne02 * ne03) / TURBO_HEAD_DIM_SR;
-    const dim3 grid_size((int)ne_total_chunks);
+    const dim3 grid_size((int) ne_total_chunks);
     const dim3 block_size(TURBO_HEAD_DIM_SR);
 
     const int64_t s01 = nb01/sizeof(float);

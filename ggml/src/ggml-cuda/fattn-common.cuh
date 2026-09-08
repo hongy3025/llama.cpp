@@ -383,23 +383,29 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
+    constexpr int turbo4_pairs = QK_TURBO4 / 2;
+    const block_turbo4_0 * const K = (const block_turbo4_0 *) K_c;
 
     float sum = 0.0f;
 
-#pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        const int k_KQ_base = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne;
+        const int k_block    = k_KQ_base / turbo4_pairs;
+        const int k_pair     = k_KQ_base % turbo4_pairs;
+        const block_turbo4_0 * const block = K + k_block;
+        const float norm = __half2float(block->d);
+
 #pragma unroll
         for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
-            const int elem = 2*k_KQ;
-
-            float2 kv;
-            dequantize_turbo4_0(K_c, elem / QK_TURBO4, (elem % QK_TURBO4) / 2, kv);
-
+            const uint8_t packed = block->qs[k_pair + k_KQ_1];
+            const int idx0 = packed & 0x0F;
+            const int idx1 = packed >> 4;
+            const float2 kv = make_float2(
+                dc_codebook_4bit[idx0] * norm,
+                dc_codebook_4bit[idx1] * norm);
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
-            const half2 kv_h = __float22half2_rn(kv);
-            ggml_cuda_mad(sum, __half22float2(kv_h), __half22float2(qv));
+            sum += kv.x * __half2float(qv.x) + kv.y * __half2float(qv.y);
 #else
             const float2 qv = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
             sum += kv.x*qv.x + kv.y*qv.y;
@@ -1155,21 +1161,56 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     const int     iqs = (int)(i0 % QK_TURBO4) / 2;
 
     static_assert(ne % 2 == 0, "bad ne");
-    T * dst_t = (T *) dst;
+    constexpr int pairs_per_block = QK_TURBO4 / 2;
+    const int npairs = ne / 2;
 
+    // The VEC kernel uses four-element, block-aligned loads for Turbo4 V.
+    // Keep the generic crossing-block path for other callers.
+    if (iqs + npairs <= pairs_per_block) {
+        const block_turbo4_0 * const block = x + ib;
+        const float norm = __half2float(block->d);
+
+        if constexpr (std::is_same_v<T, half>) {
+            half2 * const dst_h2 = (half2 *) dst;
 #pragma unroll
-    for (int l = 0; l < ne/2; ++l) {
+            for (int l = 0; l < npairs; ++l) {
+                const uint8_t packed = block->qs[iqs + l];
+                const int idx0 = packed & 0x0F;
+                const int idx1 = packed >> 4;
+                dst_h2[l] = make_half2(
+                    dc_codebook_4bit[idx0] * norm,
+                    dc_codebook_4bit[idx1] * norm);
+            }
+        } else if constexpr (std::is_same_v<T, float>) {
+            float2 * const dst_f2 = (float2 *) dst;
+#pragma unroll
+            for (int l = 0; l < npairs; ++l) {
+                const uint8_t packed = block->qs[iqs + l];
+                const int idx0 = packed & 0x0F;
+                const int idx1 = packed >> 4;
+                dst_f2[l] = make_float2(
+                    dc_codebook_4bit[idx0] * norm,
+                    dc_codebook_4bit[idx1] * norm);
+            }
+        } else {
+            static_assert(std::is_same_v<T, void>, "unsupported Turbo4 V output type");
+        }
+        return;
+    }
+
+    T * dst_t = (T *) dst;
+#pragma unroll
+    for (int l = 0; l < npairs; ++l) {
         float2 v;
         dequantize_turbo4_0(vx, ib, iqs + l, v);
         if constexpr (std::is_same_v<T, half>) {
             dst_t[2*l + 0] = __float2half(v.x);
             dst_t[2*l + 1] = __float2half(v.y);
         } else {
-            dst_t[2*l + 0] = (T)v.x;
-            dst_t[2*l + 1] = (T)v.y;
+            dst_t[2*l + 0] = (T) v.x;
+            dst_t[2*l + 1] = (T) v.y;
         }
     }
-    GGML_UNUSED(x);
 }
 
 template <ggml_type type_K, int D, int nthreads>

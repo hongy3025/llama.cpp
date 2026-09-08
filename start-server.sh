@@ -67,6 +67,7 @@ exec "$BIN" \
     --top-k 20 \
     --seed 123 \
     --spec-type draft-mtp \
+    --spec-mtp-strict-qwen \
     --spec-draft-type-k q8_0 \
     --spec-draft-type-v turbo4 \
     --spec-draft-n-max 4 \
