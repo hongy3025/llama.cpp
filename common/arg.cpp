@@ -312,6 +312,8 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -1288,6 +1290,10 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         argv = utf8.ptrs.data();
     }
 #endif
+
+    if (std::getenv("ROCMFPX_PLUGIN_PATH")) {
+        llama_backend_init();
+    }
 
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
@@ -4020,6 +4026,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     // speculative parameters
     //
 
+    add_opt(common_arg(
+        {"--spec-mtp-strict-qwen"},
+        {"--no-spec-mtp-strict-qwen"},
+        "use boundary-safe verification for exact greedy Qwen35/Qwen35MoE MTP output; requires one slot/sequence (default: disabled)",
+        [](common_params & params, bool value) {
+            params.speculative.mtp_strict_qwen = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_MTP_STRICT_QWEN"));
     add_opt(common_arg(
         {"--spec-draft-hf", "-hfd", "-hfrd", "--hf-repo-draft"}, "<user>/<model>[:quant]",
         "Same as --hf-repo, but for the draft model (default: unused)",

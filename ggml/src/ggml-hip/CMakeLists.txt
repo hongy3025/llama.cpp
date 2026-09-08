@@ -61,6 +61,10 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+list(APPEND GGML_SOURCES_ROCM
+    "../../rocmfp4/rocmfp4_hip.cu"
+    "fattn-kv-batched.cu"
+    "fattn-vec-turbo-mixed.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
@@ -79,7 +83,9 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu)
 endif()
 
 ggml_add_backend_library(ggml-hip
@@ -112,6 +118,10 @@ endif()
 
 if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
+endif()
+
+if (GGML_HIP_ROCMI4_W4A4)
+    add_compile_definitions(GGML_ROCMI4_W4A4=1)
 endif()
 
 if (NOT GGML_HIP_MMQ_MFMA)

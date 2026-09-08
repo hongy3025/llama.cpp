@@ -46,6 +46,28 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q8_0:      name = LLAMA_FTYPE_PREFIX "Q8_0"; break;
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: name = LLAMA_FTYPE_PREFIX "MXFP4 MoE"; break;
         case LLAMA_FTYPE_MOSTLY_NVFP4:     name = LLAMA_FTYPE_PREFIX "NVFP4"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4:               name = LLAMA_FTYPE_PREFIX "ROCmFP4"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN:          name = LLAMA_FTYPE_PREFIX "ROCmFP4 Lean"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT:      name = LLAMA_FTYPE_PREFIX "ROCmFP4 Coherent"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST:          name = LLAMA_FTYPE_PREFIX "ROCmFP4 Fast"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT: name = LLAMA_FTYPE_PREFIX "ROCmFP4 Fast Coherent"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX:         name = LLAMA_FTYPE_PREFIX "ROCmFP4 Strix"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN:    name = LLAMA_FTYPE_PREFIX "ROCmFP4 Strix Lean"; break;
+        case LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX:               name = LLAMA_FTYPE_PREFIX "ROCmFP2"; break;
+        case LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX_AGENT:         name = LLAMA_FTYPE_PREFIX "ROCmFP2 Agent"; break;
+        case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX:               name = LLAMA_FTYPE_PREFIX "ROCmFP3"; break;
+        case LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT:         name = LLAMA_FTYPE_PREFIX "ROCmFP3 Agent"; break;
+        case LLAMA_FTYPE_MOSTLY_Q5_0_ROCMFPX:               name = LLAMA_FTYPE_PREFIX "ROCmFP5"; break;
+        case LLAMA_FTYPE_MOSTLY_Q5_0_ROCMFPX_AGENT:         name = LLAMA_FTYPE_PREFIX "ROCmFP5 Agent"; break;
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX:               name = LLAMA_FTYPE_PREFIX "ROCmFP6"; break;
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT:         name = LLAMA_FTYPE_PREFIX "ROCmFP6 Agent"; break;
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN:          name = LLAMA_FTYPE_PREFIX "ROCmFP6 Lean"; break;
+        case LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN:    name = LLAMA_FTYPE_PREFIX "ROCmFP6 Agent Lean"; break;
+        case LLAMA_FTYPE_MOSTLY_Q7_0_ROCMFPX:               name = LLAMA_FTYPE_PREFIX "ROCmFP7"; break;
+        case LLAMA_FTYPE_MOSTLY_Q7_0_ROCMFPX_AGENT:         name = LLAMA_FTYPE_PREFIX "ROCmFP7 Agent"; break;
+        case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX:               name = LLAMA_FTYPE_PREFIX "ROCmFP8"; break;
+        case LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT:         name = LLAMA_FTYPE_PREFIX "ROCmFP8 Agent"; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4:                name = LLAMA_FTYPE_PREFIX "ROCmI4"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_K:      name = LLAMA_FTYPE_PREFIX "Q2_K - Medium"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:    name = LLAMA_FTYPE_PREFIX "Q2_K - Small"; break;
         case LLAMA_FTYPE_MOSTLY_Q3_K_S:    name = LLAMA_FTYPE_PREFIX "Q3_K - Small"; break;
@@ -769,9 +791,11 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
-            case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
-            case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
-            case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
+            case GGML_TYPE_NVFP4:                 ftype = LLAMA_FTYPE_MOSTLY_NVFP4; break;
+            case GGML_TYPE_Q4_0_ROCMFP4:          ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4; break;
+            case GGML_TYPE_Q4_0_ROCMFP4_FAST:     ftype = LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST; break;
+            case GGML_TYPE_Q1_0:                  ftype = LLAMA_FTYPE_MOSTLY_Q1_0; break;
+            case GGML_TYPE_Q2_0:                  ftype = LLAMA_FTYPE_MOSTLY_Q2_0; break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));

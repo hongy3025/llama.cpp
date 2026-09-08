@@ -389,10 +389,35 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE(128, type_K, type_V)       \
     FATTN_VEC_CASE(256, type_K, type_V)       \
 
+#define FATTN_VEC_CASES_TURBO(type_K, type_V) \
+    FATTN_VEC_CASE(128, type_K, type_V)       \
+    FATTN_VEC_CASE(256, type_K, type_V)
+
+#ifdef GGML_USE_HIP
+static ggml_tensor ggml_cuda_fattn_turbo_rotate_q(
+        const ggml_tensor * src, ggml_cuda_pool_alloc<float> & pool_buf, cudaStream_t stream);
+#endif // GGML_USE_HIP
+
+
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
+#ifdef GGML_USE_HIP
+    // TurboQuant K lives in the FWHT domain.  Rotate Q before the dot
+    // product; H is self-inverse, so this preserves K·Q in model space.
+    ggml_cuda_pool_alloc<float> q_turbo(ctx.pool());
+    ggml_tensor q_turbo_view = {};
+    ggml_tensor dst_turbo_view = {};
+    if (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0) {
+        q_turbo_view = ggml_cuda_fattn_turbo_rotate_q(Q, q_turbo, ctx.stream());
+        dst_turbo_view = *dst;
+        dst_turbo_view.src[0] = &q_turbo_view;
+        dst = &dst_turbo_view;
+        Q = &q_turbo_view;
+    }
+#endif // GGML_USE_HIP
+
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
@@ -442,6 +467,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_Q4_0_ROCMFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0_ROCMFP4_FAST)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q3_0_ROCMFPX,      GGML_TYPE_Q3_0_ROCMFPX)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q6_0_ROCMFPX,      GGML_TYPE_Q6_0_ROCMFPX)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0_ROCMFPX,      GGML_TYPE_Q8_0_ROCMFPX)
 
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_BF16)
@@ -450,17 +480,163 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_Q4_0_ROCMFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0_ROCMFP4_FAST)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q3_0_ROCMFPX,      GGML_TYPE_Q3_0_ROCMFPX)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q6_0_ROCMFPX,      GGML_TYPE_Q6_0_ROCMFPX)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0_ROCMFPX,      GGML_TYPE_Q8_0_ROCMFPX)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
+
+#ifdef GGML_USE_HIP
+    // HIP fused TurboQuant path. These are kept outside FA_ALL_QUANTS so the
+    // release/default build supports the symmetric and asymmetric KV modes.
+    FATTN_VEC_CASES_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_TURBO(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_TURBO(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_TURBO(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_TURBO(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_TURBO(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_TURBO(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
+#endif // GGML_USE_HIP
 
     GGML_ABORT("fatal error");
 }
 
 // Best FlashAttention kernel for a specific GPU:
+#ifdef GGML_USE_HIP
+static bool ggml_type_is_turbo(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
+
+static bool ggml_cuda_fattn_turbo_vec_pair_supported(ggml_type type_k, ggml_type type_v) {
+    const bool k_supported = type_k == GGML_TYPE_Q8_0 || ggml_type_is_turbo(type_k);
+    const bool v_supported = type_v == GGML_TYPE_Q8_0 || ggml_type_is_turbo(type_v);
+    return (ggml_type_is_turbo(type_k) || ggml_type_is_turbo(type_v)) && k_supported && v_supported;
+}
+
+// TurboQuant SET_ROWS encodes independent normalized 128-point FWHT chunks.
+// This kernel is self-inverse: it rotates Q into the packed cache domain and,
+// after attention, rotates the accumulated V result back to model space.
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void k_fattn_turbo_fwht_128(
+        const char * __restrict__ src,
+        float      * __restrict__ dst,
+        int64_t ne0, int64_t ne1, int64_t ne2,
+        int64_t nb1, int64_t nb2, int64_t nb3) {
+    __shared__ float values[128];
+
+    const int tid = threadIdx.x;
+    const int64_t chunks_per_row = ne0 / 128;
+    const int64_t chunk = blockIdx.x % chunks_per_row;
+    int64_t row = blockIdx.x / chunks_per_row;
+    const int64_t i1 = row % ne1;
+    row /= ne1;
+    const int64_t i2 = row % ne2;
+    const int64_t i3 = row / ne2;
+
+    const float * src_row = (const float *) (src + i1*nb1 + i2*nb2 + i3*nb3);
+    values[tid] = src_row[chunk*128 + tid];
+    __syncthreads();
+
+    for (int h = 1; h < 128; h <<= 1) {
+        if (tid < 64) {
+            const int group = tid / h;
+            const int pos   = tid % h;
+            const int i0    = group*2*h + pos;
+            const float a   = values[i0];
+            const float b   = values[i0 + h];
+            values[i0]      = a + b;
+            values[i0 + h]  = a - b;
+        }
+        __syncthreads();
+    }
+
+    dst[(int64_t) blockIdx.x*128 + tid] = values[tid] * 0.08838834764831844f;
+}
+
+
+static void ggml_cuda_fattn_turbo_fwht_128(
+        const ggml_tensor * src, float * dst, cudaStream_t stream) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->ne[0] == 128 || src->ne[0] == 256);
+    GGML_ASSERT(src->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_nelements(src) % 128 == 0);
+
+    const int64_t nblocks = ggml_nelements(src) / 128;
+    k_fattn_turbo_fwht_128<<<nblocks, 128, 0, stream>>>(
+        (const char *) src->data, dst,
+        src->ne[0], src->ne[1], src->ne[2],
+        src->nb[1], src->nb[2], src->nb[3]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static ggml_tensor ggml_cuda_fattn_turbo_rotate_q(
+        const ggml_tensor * src, ggml_cuda_pool_alloc<float> & pool_buf, cudaStream_t stream) {
+    pool_buf.alloc(ggml_nelements(src));
+    ggml_cuda_fattn_turbo_fwht_128(src, pool_buf.ptr, stream);
+
+    ggml_tensor tmp = *src;
+    tmp.data  = pool_buf.ptr;
+    tmp.nb[0] = sizeof(float);
+    tmp.nb[1] = tmp.ne[0] * tmp.nb[0];
+    tmp.nb[2] = tmp.ne[1] * tmp.nb[1];
+    tmp.nb[3] = tmp.ne[2] * tmp.nb[2];
+    tmp.view_src  = nullptr;
+    tmp.view_offs = 0;
+    return tmp;
+}
+static ggml_tensor ggml_cuda_fattn_pre_dequantize(
+        const ggml_tensor * src, ggml_cuda_pool_alloc<half> & pool_buf,
+        cudaStream_t stream) {
+    pool_buf.alloc(ggml_nelements(src));
+
+    const to_fp16_nc_cuda_t dequant = ggml_get_to_fp16_nc_cuda(src->type);
+    GGML_ASSERT(dequant != nullptr);
+    GGML_ASSERT(src->nb[0] == ggml_type_size(src->type));
+
+    const size_t ts = ggml_type_size(src->type);
+    dequant(src->data, pool_buf.ptr,
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+            src->nb[1] / ts, src->nb[2] / ts, src->nb[3] / ts, stream);
+
+    ggml_tensor tmp = *src;
+    tmp.type = GGML_TYPE_F16;
+    tmp.data = pool_buf.ptr;
+    tmp.nb[0] = sizeof(half);
+    tmp.nb[1] = src->ne[0] * tmp.nb[0];
+    tmp.nb[2] = src->ne[1] * tmp.nb[1];
+    tmp.nb[3] = src->ne[2] * tmp.nb[2];
+    tmp.view_src  = nullptr;
+    tmp.view_offs = 0;
+
+    return tmp;
+}
+
+
+static bool ggml_cuda_fattn_turbo_vec_fused_eligible(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    return ggml_cuda_fattn_turbo_vec_pair_supported(K->type, V->type) &&
+           (K->ne[0] == 128 || K->ne[0] == 256) &&
+           V->ne[0] == K->ne[0] && Q->ne[0] == K->ne[0] &&
+           K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+           Q->nb[0] == ggml_element_size(Q) &&
+           K->nb[0] == ggml_element_size(K) &&
+           V->nb[0] == ggml_element_size(V) &&
+           ggml_is_contiguous(dst);
+}
+
+#endif // GGML_USE_HIP
+
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
     BEST_FATTN_KERNEL_TILE    = 200,
@@ -482,6 +658,10 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+#ifdef GGML_USE_HIP
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+#endif // GGML_USE_HIP
             return true;
         default:
             return false;
@@ -573,7 +753,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+#ifdef GGML_USE_HIP
+    const bool incompatible_types =
+        K->type != V->type && !ggml_cuda_fattn_turbo_vec_pair_supported(K->type, V->type);
+#else
+    const bool incompatible_types = K->type != V->type;
+#endif // GGML_USE_HIP
+    if (incompatible_types) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -587,8 +773,48 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
-    // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+#ifdef GGML_USE_HIP
+    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 &&
+                                       (K->ne[1] % FATTN_KQ_STRIDE == 0 || Q->ne[1] <= 8);
+#else
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+#endif
+
+#ifdef GGML_USE_HIP
+    // ROCm MTP decode can produce short, non-256-aligned KV lengths. The
+    // tile dispatcher has no safe small-batch path for those shapes.
+    if (can_use_vector_kernel && Q->ne[1] <= 8) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+#endif
+    const bool is_rocmfp_family = K->type == GGML_TYPE_Q4_0_ROCMFP4 ||
+                                  K->type == GGML_TYPE_Q4_0_ROCMFP4_FAST ||
+                                  K->type == GGML_TYPE_Q3_0_ROCMFPX ||
+                                  K->type == GGML_TYPE_Q6_0_ROCMFPX ||
+                                  K->type == GGML_TYPE_Q8_0_ROCMFPX;
+
+    if (is_rocmfp_family) {
+        if (can_use_vector_kernel && Q->ne[1] <= 2) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+#ifdef GGML_USE_HIP
+    // Packed Turbo KV is consumed directly by the HIP VEC kernel for every
+    // eligible batch size; this keeps prompt and decode on the Turbo path.
+    if (ggml_cuda_fattn_turbo_vec_fused_eligible(dst) && can_use_vector_kernel) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
+    // HIP graph capture cannot tolerate cudaMalloc/cudaFree in the TILE/MMA
+    // quantized-KV f16 temp path. Route small decode/speculative batches through
+    // VEC, which dequantizes inline and avoids capture-unsafe allocation calls.
+    // Large prefill batches still fall through to the faster TILE/MMA path.
+    if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel && Q->ne[1] <= 8) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+#endif // GGML_USE_HIP
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -665,6 +891,82 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
     return BEST_FATTN_KERNEL_TILE;
 }
+#ifdef GGML_USE_HIP
+static bool ggml_cuda_fattn_has_turbo_kv(const ggml_tensor * dst) {
+    return ggml_type_is_turbo(dst->src[1]->type) ||
+           ggml_type_is_turbo(dst->src[2]->type);
+}
+
+static best_fattn_kernel ggml_cuda_fattn_pre_dequantized_kernel(
+        const ggml_tensor * dst, best_fattn_kernel raw_kernel) {
+    if (raw_kernel != BEST_FATTN_KERNEL_VEC) {
+        return raw_kernel;
+    }
+
+    // A VEC dispatch selected for a packed or mixed pair may not have a
+    // matching template after its operands are converted to F16.
+    return ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+}
+
+static void ggml_cuda_fattn_run_kernel(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        best_fattn_kernel kernel) {
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_NONE:
+            GGML_ABORT("fatal error");
+        case BEST_FATTN_KERNEL_TILE:
+            ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_VEC:
+            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+    }
+}
+
+static void ggml_cuda_fattn_run_turbo_fallback(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        best_fattn_kernel raw_kernel) {
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const bool k_is_turbo = ggml_type_is_turbo(K->type);
+    const bool v_is_turbo = ggml_type_is_turbo(V->type);
+
+    ggml_cuda_pool_alloc<half> k_pool(ctx.pool());
+    ggml_cuda_pool_alloc<half> v_pool(ctx.pool());
+    ggml_cuda_pool_alloc<float> q_pool(ctx.pool());
+    ggml_tensor k_f16;
+    ggml_tensor v_f16;
+    ggml_tensor q_rot;
+    ggml_tensor fallback = *dst;
+
+    // Standard FA kernels consume F16 K/V views here. Converting both
+    // operands keeps this fallback independent of mixed quantized templates.
+    if (K->type != GGML_TYPE_F16) {
+        k_f16 = ggml_cuda_fattn_pre_dequantize(K, k_pool, ctx.stream());
+        fallback.src[1] = &k_f16;
+    }
+    if (V->type != GGML_TYPE_F16) {
+        v_f16 = ggml_cuda_fattn_pre_dequantize(V, v_pool, ctx.stream());
+        fallback.src[2] = &v_f16;
+    }
+    if (k_is_turbo) {
+        q_rot = ggml_cuda_fattn_turbo_rotate_q(
+                dst->src[0], q_pool, ctx.stream());
+        fallback.src[0] = &q_rot;
+    }
+
+    const best_fattn_kernel kernel =
+        ggml_cuda_fattn_pre_dequantized_kernel(&fallback, raw_kernel);
+    ggml_cuda_fattn_run_kernel(ctx, &fallback, kernel);
+    if (v_is_turbo) {
+        ggml_cuda_fattn_turbo_fwht_128(&fallback, (float *) fallback.data, ctx.stream());
+    }
+}
+#endif // GGML_USE_HIP
+
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
@@ -702,7 +1004,32 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+
+    const best_fattn_kernel kernel =
+        ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+
+#ifdef GGML_USE_HIP
+    if (ggml_cuda_fattn_has_turbo_kv(dst)) {
+        if (kernel == BEST_FATTN_KERNEL_NONE) {
+            GGML_ABORT("fatal error");
+        }
+
+        if (kernel == BEST_FATTN_KERNEL_VEC &&
+                ggml_cuda_fattn_turbo_vec_fused_eligible(dst)) {
+            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            if (ggml_type_is_turbo(dst->src[2]->type)) {
+                ggml_cuda_fattn_turbo_fwht_128(
+                        dst, (float *) dst->data, ctx.stream());
+            }
+            return;
+        }
+
+        ggml_cuda_fattn_run_turbo_fallback(ctx, dst, kernel);
+        return;
+    }
+#endif // GGML_USE_HIP
+
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

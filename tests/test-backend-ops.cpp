@@ -4639,6 +4639,10 @@ struct test_mul_mat : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        // W4A4 quantizes activations to IU4; exact ROCmI4 keeps the normal threshold.
+        if (type_a == GGML_TYPE_Q4_0_ROCMI4 && backend_has_feature(backend, "ROCMI4_W4A4")) {
+            return 1e-2;
+        }
         return max_nmse_err();
     }
 
@@ -4922,6 +4926,10 @@ struct test_mul_mat_id : public test_case {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
+        }
+        // Match test_mul_mat for the advertised W4A4 activation path.
+        if (type_a == GGML_TYPE_Q4_0_ROCMI4 && backend_has_feature(backend, "ROCMI4_W4A4")) {
+            return 1e-2;
         }
         return max_nmse_err();
     }
@@ -8641,6 +8649,14 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
+    GGML_TYPE_Q2_0_ROCMFPX,
+    GGML_TYPE_Q3_0_ROCMFPX,
+    GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST,
+    GGML_TYPE_Q4_0_ROCMI4,
+    GGML_TYPE_Q5_0_ROCMFPX,
+    GGML_TYPE_Q6_0_ROCMFPX,
+    GGML_TYPE_Q7_0_ROCMFPX,
+    GGML_TYPE_Q8_0_ROCMFPX,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
@@ -10433,6 +10449,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1},   113,   4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1},   113,   8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1},  1025,   4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 2},  1025,   1, true, true,  8, 30, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -10680,6 +10700,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Long-sequence Mamba-2 shapes that select the SSD matmul path on capable
+    // CUDA/HIP devices. GGML_CUDA_DISABLE_SSD=1 provides a same-binary scan
+    // baseline for tuning and regression measurements.
+    test_cases.emplace_back(new test_ssm_scan(
+        GGML_TYPE_F32, 128, 80, 128, 1, 256, 1, false, 1, false));
+    test_cases.emplace_back(new test_ssm_scan(
+        GGML_TYPE_F32, 128, 64, 80, 8, 300, 2, false, 1, false));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

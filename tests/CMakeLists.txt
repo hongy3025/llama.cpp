@@ -330,7 +330,17 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+    llama_build(test-turboquant.cpp)
+    llama_test(test-turboquant)
 endif()
+
+add_library(rocmfpx-test-plugin MODULE rocmfpx-test-plugin.c)
+target_include_directories(rocmfpx-test-plugin PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(rocmfpx-test-plugin PRIVATE ROCMFPX_PLUGIN_BUILD)
+set_target_properties(rocmfpx-test-plugin PROPERTIES PREFIX "")
+llama_build(test-rocmfpx-plugin.cpp)
+add_dependencies(test-rocmfpx-plugin rocmfpx-test-plugin)
+llama_test(test-rocmfpx-plugin ARGS $<TARGET_FILE:rocmfpx-test-plugin>)
 
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)

@@ -73,28 +73,71 @@ static __global__ void flash_attn_ext_vec(
 
 #ifdef GGML_USE_HIP
 #ifdef RDNA
-    constexpr int nthreads_KQ_q = 2;
+    constexpr int nthreads_KQ_q_default = 2;
+    constexpr int nthreads_KQ_q_rocmfp4_default = 1;
 #else
-    constexpr int nthreads_KQ_q = 4;
+    constexpr int nthreads_KQ_q_default = 4;
+    constexpr int nthreads_KQ_q_rocmfp4_default = nthreads_KQ_q_default;
 #endif // RDNA
-    constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
+    constexpr bool type_K_rocmfp4 = type_K == GGML_TYPE_Q4_0_ROCMFP4 || type_K == GGML_TYPE_Q4_0_ROCMFP4_FAST;
+    constexpr bool type_K_rocmfpx = type_K == GGML_TYPE_Q3_0_ROCMFPX || type_K == GGML_TYPE_Q6_0_ROCMFPX || type_K == GGML_TYPE_Q8_0_ROCMFPX;
+    constexpr bool type_V_rocmfp4 = type_V == GGML_TYPE_Q4_0_ROCMFP4 || type_V == GGML_TYPE_Q4_0_ROCMFP4_FAST;
+#ifndef GGML_ROCMFP4_FATTN_KQ_NTHREADS
+#define GGML_ROCMFP4_FATTN_KQ_NTHREADS nthreads_KQ_q_rocmfp4_default
+#endif
+#ifndef GGML_ROCMFPX_FATTN_KQ_NTHREADS
+#define GGML_ROCMFPX_FATTN_KQ_NTHREADS nthreads_KQ_q_default
+#endif
+#ifndef GGML_ROCMFP4_FATTN_V_NTHREADS
+#define GGML_ROCMFP4_FATTN_V_NTHREADS 2
+#endif
+#ifndef GGML_ROCMFP4_FATTN_V_NTHREADS_D128_DUAL
+#define GGML_ROCMFP4_FATTN_V_NTHREADS_D128_DUAL 4
+#endif
+#ifndef GGML_ROCMFP4_FATTN_V_ROWS_PER_THREAD
+#define GGML_ROCMFP4_FATTN_V_ROWS_PER_THREAD 8
+#endif
+#if GGML_ROCMFP4_FATTN_V_ROWS_PER_THREAD != 2 && \
+    GGML_ROCMFP4_FATTN_V_ROWS_PER_THREAD != 4 && \
+    GGML_ROCMFP4_FATTN_V_ROWS_PER_THREAD != 8
+#error "GGML_ROCMFP4_FATTN_V_ROWS_PER_THREAD must be 2, 4, or 8"
+#endif
+    constexpr int nthreads_KQ_q = type_K_rocmfp4 ? GGML_ROCMFP4_FATTN_KQ_NTHREADS :
+                                  type_K_rocmfpx ? GGML_ROCMFPX_FATTN_KQ_NTHREADS :
+                                  nthreads_KQ_q_default;
+    constexpr int nthreads_V_q_rocmfp4 =
+        type_V == GGML_TYPE_Q4_0_ROCMFP4 && D == 128 ? GGML_ROCMFP4_FATTN_V_NTHREADS_D128_DUAL :
+        GGML_ROCMFP4_FATTN_V_NTHREADS;
+    constexpr int nthreads_V_q  = type_V_rocmfp4 ? nthreads_V_q_rocmfp4 : (D/4 < 32 ? D/4 : 32);
+    constexpr int V_rows_per_thread_q = type_V_rocmfp4 ? GGML_ROCMFP4_FATTN_V_ROWS_PER_THREAD : 4;
 #else
     constexpr int nthreads_KQ_q = (D/4 < 32 ? D/4 : 32);
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
+    constexpr int V_rows_per_thread_q = 4;
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
-    constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
+#ifdef GGML_USE_HIP
+    // Turbo K is consumed in its FWHT domain by a float/half dot helper. Q is
+    // transformed before VEC dispatch, so retain the fp-like Q register path.
+    constexpr bool K_is_fp_like = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 ||
+                                   type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0);
+#else
+    constexpr bool K_is_fp_like = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16);
+#endif
+    constexpr bool V_is_fp_like = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16);
+
+    constexpr int nthreads_KQ = K_is_fp_like ? 128 / cpy_nb : nthreads_KQ_q;
+    constexpr int nthreads_V  = V_is_fp_like ? 128 / cpy_nb : nthreads_V_q;
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
+    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : V_rows_per_thread_q;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    constexpr bool Q_q8_1 = !K_is_fp_like;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -248,6 +291,13 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+#ifdef GGML_USE_HIP
+    constexpr bool turbo_kv = type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 ||
+                              type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0;
+    const int32_t mask_row_stride = turbo_kv ? nb31 / (int32_t) sizeof(half) : ne11;
+#else
+    const int32_t mask_row_stride = ne11;
+#endif
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
@@ -267,18 +317,19 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+            const bool valid_kq = k_VKQ_0 + i_KQ < k_VKQ_max;
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                float sum = valid_kq ? vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]) : -FLT_MAX;
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
-                if (use_logit_softcap) {
+                if (valid_kq && use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
                 }
 
-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                if (valid_kq && mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                    sum += slope*__half2float(maskh[j*mask_row_stride + i_KQ]);
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -324,6 +375,9 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
+            const bool valid_k = k_VKQ_0 + k < k_VKQ_max;
+            // Zero-weight tail lanes reuse the first valid V row.
+            const char * V_k = V + (valid_k ? k : 0)*nb21;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
@@ -336,14 +390,14 @@ static __global__ void flash_attn_ext_vec(
                 half2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
+                    dequantize_V(V_k, tmp_f,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
+                    dequantize_V(V_k, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
@@ -363,7 +417,7 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
+                dequantize_V(V_k, tmp,
                     2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -609,3 +663,42 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_Q4_0_ROCMFP4);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_Q4_0_ROCMFP4);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0_ROCMFP4,      GGML_TYPE_Q4_0_ROCMFP4);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0_ROCMFP4_FAST);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0_ROCMFP4_FAST);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0_ROCMFP4_FAST);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q3_0_ROCMFPX, GGML_TYPE_Q3_0_ROCMFPX);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q3_0_ROCMFPX, GGML_TYPE_Q3_0_ROCMFPX);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q3_0_ROCMFPX, GGML_TYPE_Q3_0_ROCMFPX);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q6_0_ROCMFPX);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q6_0_ROCMFPX);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q6_0_ROCMFPX);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0_ROCMFPX, GGML_TYPE_Q8_0_ROCMFPX);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0_ROCMFPX, GGML_TYPE_Q8_0_ROCMFPX);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0_ROCMFPX, GGML_TYPE_Q8_0_ROCMFPX);
+
+#ifdef GGML_USE_HIP
+#define EXTERN_DECL_FATTN_VEC_TURBO_PAIR(type_K, type_V) \
+    extern DECL_FATTN_VEC_CASE(128, type_K, type_V);      \
+    extern DECL_FATTN_VEC_CASE(256, type_K, type_V);      \
+
+EXTERN_DECL_FATTN_VEC_TURBO_PAIR(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+EXTERN_DECL_FATTN_VEC_TURBO_PAIR(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+EXTERN_DECL_FATTN_VEC_TURBO_PAIR(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
+EXTERN_DECL_FATTN_VEC_TURBO_PAIR(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+EXTERN_DECL_FATTN_VEC_TURBO_PAIR(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
+EXTERN_DECL_FATTN_VEC_TURBO_PAIR(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
+EXTERN_DECL_FATTN_VEC_TURBO_PAIR(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
+EXTERN_DECL_FATTN_VEC_TURBO_PAIR(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
+#else
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+#endif // GGML_USE_HIP

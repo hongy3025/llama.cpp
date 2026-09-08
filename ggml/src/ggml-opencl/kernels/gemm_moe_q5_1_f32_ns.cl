@@ -276,6 +276,10 @@ kernel void kernel_gemm_moe_q5_1_f32_ns(
         return;
     }
 
+    if ((get_global_id(0) + block_id_m * TILESIZE_M) >= ne01) {
+        return;
+    }
+
     // Load poster router and share in LM
     __local uint out_idx[TILESIZE_N];
 
