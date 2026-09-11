@@ -1,0 +1,47 @@
+name: Sync upstream master
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 14 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Sync from upstream
+        env:
+          UPSTREAM_REPOSITORY: https://github.com/ggml-org/llama.cpp.git
+          TARGET_BRANCH: master
+          SYNC_WORKFLOW: .github/workflows/sync-upstream.yml
+        run: |
+          set -euo pipefail
+
+          cp "$SYNC_WORKFLOW" /tmp/sync-upstream.yml
+          git remote add upstream "$UPSTREAM_REPOSITORY"
+          git fetch --prune upstream "$TARGET_BRANCH"
+          git reset --hard "upstream/$TARGET_BRANCH"
+
+          mkdir -p "$(dirname "$SYNC_WORKFLOW")"
+          cp /tmp/sync-upstream.yml "$SYNC_WORKFLOW"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git diff --quiet; then
+            echo 'Target master is already synchronized.'
+            exit 0
+          fi
+
+          git add -A
+          git commit -m 'Sync master from ggml-org/llama.cpp'
+          git push --force origin "HEAD:$TARGET_BRANCH"
